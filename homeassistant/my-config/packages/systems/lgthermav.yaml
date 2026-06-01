@@ -1,0 +1,735 @@
+# ==========================
+# LG Thermav Wärmepumpe YAML
+# ==========================
+
+lgthermav:
+  # ----------
+  # Modbus TCP
+  # ----------
+  modbus:
+    - name: "modbus_waveshare"
+      type: tcp
+      host: !secret modbus_waveshare_ip
+      port: 502
+
+      sensors:
+        # ---------------------------
+        # Input Registers (Read-only)
+        # ---------------------------
+        - name: "Fehlerkennung (30001)"
+          unique_id: lgthermav_sensor_30001
+          address: 0
+          input_type: input
+          scan_interval: 10
+
+        - name: "ODU-Betriebszyklus (30002)"
+          unique_id: lgthermav_sensor_30002
+          address: 1
+          input_type: input
+          scan_interval: 10
+
+        - name: "Wassereinlasstemperatur (30003)"
+          unique_id: lgthermav_sensor_30003
+          address: 2
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+          device_class: temperature
+
+        - name: "Wasserauslasstemperatur (30004)"
+          unique_id: lgthermav_sensor_30004
+          address: 3
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+          device_class: temperature
+
+        - name: "Wasserauslasstemperatur Backup (30005)"
+          unique_id: lgthermav_sensor_30005
+          address: 4
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+          device_class: temperature
+
+        - name: "Temperatur Pufferspeicher (30006)"
+          unique_id: lgthermav_sensor_30006
+          address: 5
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+          device_class: temperature
+
+        - name: "Raumlufttemperatur (30008)"
+          unique_id: lgthermav_sensor_30008
+          address: 7
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Durchflussrate (30009)"
+          unique_id: lgthermav_sensor_30009
+          address: 8
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          zero_suppress: 5
+          unit_of_measurement: "L/min"
+
+        - name: "Durchflusstemperatur Kreis 2 (30010)"
+          unique_id: lgthermav_sensor_30010
+          address: 9
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Energiezustand (30012)"
+          unique_id: lgthermav_sensor_30012
+          address: 11
+          input_type: input
+          scan_interval: 10
+
+        - name: "Außenlufttemperatur (30013)"
+          unique_id: lgthermav_sensor_30013
+          address: 12
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Wasserdruck (30014)"
+          unique_id: lgthermav_sensor_30014
+          address: 13
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: pressure
+          unit_of_measurement: "bar"
+
+        - name: "Flüssiggastemperatur (30017)"
+          unique_id: lgthermav_sensor_30017
+          address: 16
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Absaugtemperatur (30019)"
+          unique_id: lgthermav_sensor_30019
+          address: 18
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Heißgastemperatur (30020)"
+          unique_id: lgthermav_sensor_30020
+          address: 19
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Dampftemperatur 1 (30021)"
+          unique_id: lgthermav_sensor_30021
+          address: 20
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Dampftemperatur 2 (30022)"
+          unique_id: lgthermav_sensor_30022
+          address: 21
+          input_type: input
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          device_class: temperature
+          unit_of_measurement: "°C"
+
+        - name: "Hochdruckseite (30023)"
+          unique_id: lgthermav_sensor_30023
+          address: 22
+          input_type: input
+          scan_interval: 10
+          precision: 0
+          device_class: pressure
+          unit_of_measurement: "hPa"
+
+        - name: "Niederdruckseite (30024)"
+          unique_id: lgthermav_sensor_30024
+          address: 23
+          input_type: input
+          scan_interval: 10
+          precision: 0
+          device_class: pressure
+          unit_of_measurement: "hPa"
+
+        - name: "Umrichterfrequenz (30025)"
+          unique_id: lgthermav_sensor_30025
+          address: 24
+          input_type: input
+          scan_interval: 10
+          precision: 0
+          device_class: frequency
+          unit_of_measurement: "Hz"
+
+        # ------------------------------
+        # Holding Registers (Read/Write)
+        # ------------------------------
+        - name: "Betriebsmodus (40001)"
+          unique_id: lgthermav_sensor_40001
+          address: 0
+          input_type: holding
+          scan_interval: 10
+
+        - name: "Steuermethode (40002)"
+          unique_id: lgthermav_sensor_40002
+          address: 1
+          input_type: holding
+          scan_interval: 10
+
+        - name: "Solltemperatur Kreis 1 (40003)"
+          unique_id: lgthermav_sensor_40003
+          address: 2
+          input_type: holding
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+
+        - name: "AI-Offset Kreis 1 (40005)"
+          unique_id: lgthermav_sensor_40005
+          address: 4
+          input_type: holding
+          scan_interval: 10
+          precision: 0
+          unit_of_measurement: "°C"
+
+        - name: "Solltemperatur Kreis 2 (40006)"
+          unique_id: lgthermav_sensor_40006
+          address: 5
+          input_type: holding
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+
+        - name: "AI-Offset Kreis 2 (40008)"
+          unique_id: lgthermav_sensor_40008
+          address: 7
+          input_type: holding
+          scan_interval: 10
+          precision: 0
+          unit_of_measurement: "°C"
+
+        - name: "WW-Solltemperatur (40009)"
+          unique_id: lgthermav_sensor_40009
+          address: 8
+          input_type: holding
+          scan_interval: 10
+          scale: 0.1
+          precision: 1
+          unit_of_measurement: "°C"
+
+        - name: "Energiezustand-Eingang (40010)"
+          unique_id: lgthermav_sensor_40010
+          address: 9
+          input_type: holding
+          scan_interval: 10
+
+      # --------------
+      # Binary Sensors
+      # --------------
+      binary_sensors:
+        - name: "Wasserdurchfluss (20001)"
+          unique_id: lgthermav_binary_20001
+          address: 0
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Umwälzpumpe (20002)"
+          unique_id: lgthermav_binary_20002
+          address: 1
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "externe Umwälzpumpe (20003)"
+          unique_id: lgthermav_binary_20003
+          address: 2
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Kompressor (20004)"
+          unique_id: lgthermav_binary_20004
+          address: 3
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Abtauen (20005)"
+          unique_id: lgthermav_binary_20005
+          address: 4
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "WW-Status (20006)"
+          unique_id: lgthermav_binary_20006
+          address: 5
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Silent Mode (20008)"
+          unique_id: lgthermav_binary_20008
+          address: 7
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Zusatzheizung 1 (20011)"
+          unique_id: lgthermav_binary_20011
+          address: 10
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Zusatzheizung 2 (20012)"
+          unique_id: lgthermav_binary_20012
+          address: 11
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "WW-Booster (20013)"
+          unique_id: lgthermav_binary_20013
+          address: 12
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Fehler (20014)"
+          unique_id: lgthermav_binary_20014
+          address: 13
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: problem
+
+        - name: "Notbetrieb Heizung (20015)"
+          unique_id: lgthermav_binary_20015
+          address: 14
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Notbetrieb WW (20016)"
+          unique_id: lgthermav_binary_20016
+          address: 15
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+        - name: "Mischpumpe (20017)"
+          unique_id: lgthermav_binary_20017
+          address: 16
+          input_type: discrete_input
+          scan_interval: 10
+          device_class: running
+
+      switches:
+        # -------------------------
+        # Switches (Coil Registers)
+        # -------------------------
+        - name: "Heizungsschalter (10001)"
+          unique_id: lgthermav_switch_10001
+          address: 0
+          write_type: coil
+          command_on: 1
+          command_off: 0
+          verify:
+            input_type: coil
+            address: 0
+            state_on: 1
+            state_off: 0
+
+        - name: "Warmwasserschalter (10002)"
+          unique_id: lgthermav_switch_10002
+          address: 1
+          write_type: coil
+          command_on: 1
+          command_off: 0
+          verify:
+            input_type: coil
+            address: 1
+            state_on: 1
+            state_off: 0
+
+        - name: "Silent Mode (10003)"
+          unique_id: lgthermav_switch_10003
+          address: 2
+          write_type: coil
+          command_on: 1
+          command_off: 0
+          verify:
+            input_type: coil
+            address: 2
+            state_on: 1
+            state_off: 0
+
+        - name: "Notaus (10005)"
+          unique_id: lgthermav_switch_10005
+          address: 4
+          write_type: coil
+          command_on: 1
+          command_off: 0
+          verify:
+            input_type: coil
+            address: 4
+            state_on: 1
+            state_off: 0
+
+        - name: "Notbetrieb starten (10006)"
+          unique_id: lgthermav_switch_10006
+          address: 5
+          write_type: coil
+          command_on: 1
+          command_off: 0
+          verify:
+            input_type: coil
+            address: 5
+            state_on: 1
+            state_off: 0
+
+  # -----------------------------
+  # Input Numbers (für Sollwerte)
+  # -----------------------------
+  input_number:
+    thermav_40003:
+      name: "Solltemperatur Kreis 1"
+      initial: 26
+      min: 18
+      max: 65      # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
+      step: 1
+      unit_of_measurement: "°C"
+      mode: slider
+
+    thermav_40005:
+      name: "AI-Offset Kreis 1"
+      initial: 0
+      min: -5
+      max: 5
+      step: 1
+      unit_of_measurement: "°C"
+
+    thermav_40006:
+      name: "Solltemperatur Kreis 2 "
+      initial: 26
+      min: 18
+      max: 65      # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
+      step: 1
+      unit_of_measurement: "°C"
+      mode: slider
+
+    thermav_40008:
+      name: "AI-Offset Kreis 2"
+      initial: 0
+      min: -5
+      max: 5
+      step: 1
+      unit_of_measurement: "°C"
+
+    thermav_40009:
+      name: "WW-Solltemperatur"
+      initial: 51
+      min: 45
+      max: 55
+      step: 1
+      unit_of_measurement: "°C"
+
+    # Energiezustand (SG-Ready / ESS-Eingang per Modbus)
+    # Wird von der FSM (heatpump_fsm.py) für den Heizstab-Boost genutzt.
+    # Werte
+    # 0: 'Nicht verwendet',
+    # 1: 'Erzwungen Aus',
+    # 2: 'Normalbetrieb',
+    # 3: 'Empfehlung Ein (+2°C)',
+    # 4: 'Befehl Ein (WW 80°C)',
+    # 5: 'Befehl++ (+5°C, Heizstab)',
+    # 6: 'Empfehlung+ (+2°C)',
+    # 7: 'Energiesparen (-2°C)',
+    # 8: 'Superenergiespar (-5°C)'
+    thermav_40010:
+      name: "Energiezustand (40010)"
+      initial: 2
+      min: 0
+      max: 8
+      step: 1
+      mode: box
+      icon: mdi:lightning-bolt-circle
+
+  template:
+    # ---------------
+    # Analog Sensoren
+    # ---------------
+    - sensor:
+        - name: "Heizkurve Steigung (m)"
+          unique_id: lgthermav_sensor_heizkurve_m
+          unit_of_measurement: "°C/°C"
+          state: >
+            {% set ax = states('input_number.heizkurve_ax')|float(0) %}
+            {% set ay = states('input_number.heizkurve_ay')|float(0) %}
+            {% set bx = states('input_number.heizkurve_bx')|float(0) %}
+            {% set by = states('input_number.heizkurve_by')|float(0) %}
+            {{ (by - ay) / (bx - ax) }}
+
+        - name: "Heizkurve Achsenabschnitt (b)"
+          unique_id: lgthermav_sensor_heizkurve_b
+          unit_of_measurement: "°C"
+          state: >
+            {% set ax = states('input_number.heizkurve_ax')|float(0) %}
+            {% set ay = states('input_number.heizkurve_ay')|float(0) %}
+            {% set bx = states('input_number.heizkurve_bx')|float(0) %}
+            {% set by = states('input_number.heizkurve_by')|float(0) %}
+            {{ (ax * by - ay * bx) / (ax - bx) }}
+
+        - name: "WP Kreislauf Mittelwert"
+          unique_id: lgthermav_sensor_wpkreislaufmittelwert
+          unit_of_measurement: "°C"
+          state_class: measurement
+          state: >
+            {% set s1 = states('sensor.wassereinlasstemperatur_30003') %}
+            {% set s2 = states('sensor.wasserauslasstemperatur_30004') %}
+            {% if s1 not in ['unavailable','unknown'] and s2 not in ['unavailable','unknown'] %}
+              {{ ((s1|float + s2|float) / 2)|round(1) }}           
+            {% else %}
+              {{ this.state }}
+            {% endif %}
+
+        - name: "WP Wärmeleistung"
+          unique_id: lgthermav_sensor_warmeleistung
+          unit_of_measurement: "W"
+          device_class: power
+          availability: >
+            {{ is_state('binary_sensor.kompressor_20004', 'on') 
+              and is_state('binary_sensor.wasserdurchfluss_20001', 'on') }}
+          state: >
+            {% set vl = states('sensor.wassereinlasstemperatur_30003')|float(0) %}
+            {% set rl = states('sensor.wasserauslasstemperatur_30004')|float(0) %}
+            {% set f = states('sensor.durchflussrate_30009')|float(0) %}
+            {% set cp = states('sensor.iapws95_dichte')|float(0) * states('sensor.iapws95_warmekapazitat_cp')|float(0) / 60 %}
+            {% if f > 0 and rl > 0 and vl > 0 %}
+              {{ (cp * max(0, rl - vl) * f)|round(1) }}
+            {% else %}
+              0
+            {% endif %}
+
+        - name: "WP Arbeitszahl"
+          unique_id: lgthermav_sensor_arbeitszahl
+          unit_of_measurement: "W(th)/W(el)"
+          state_class: measurement
+          availability: >
+            {{ states('sensor.energiezahler_it_schaltschrank_leistung_warmepumpe')|float(0) > 0
+              and states('sensor.wp_warmeleistung')|float(0) > 0 }}
+          state: >
+            {% set el = states('sensor.energiezahler_it_schaltschrank_leistung_warmepumpe')|float(0) %}
+            {% set therm = states('sensor.wp_warmeleistung')|float(0) %}
+            {{ (therm / el)|round(2) }}
+
+        - name: "Carnot-COP"
+          unique_id: lgthermav_sensor_carnot_cop
+          unit_of_measurement: "Eta"
+          availability: >
+            {{ states('sensor.wp_arbeitszahl') not in ['unavailable', 'unknown'] }}
+          state: >
+            {% set t_heiss = states('sensor.heissgastemperatur_30020')|float(0) %}
+            {% set t_dampf = states('sensor.dampftemperatur_1_30021')|float(0) %}
+            {% if (t_heiss - t_dampf) != 0 %}
+              {{ ((273.15 + t_heiss) / (t_heiss - t_dampf))|round(2) }}
+            {% else %}
+              unavailable
+            {% endif %}
+
+        - name: "Carnot-Effizienz"
+          unique_id: lgthermav_sensor_carnot_effizienz
+          unit_of_measurement: "%"
+          availability: >
+            {{ states('sensor.wp_arbeitszahl') not in ['unavailable', 'unknown']
+              and states('sensor.carnot_cop') not in ['unavailable', 'unknown']
+              and states('sensor.carnot_cop')|float(0) != 0 }}
+          state: >
+            {{ 100 * states('sensor.wp_arbeitszahl')|float(0) / states('sensor.carnot_cop')|float(0) }}
+
+        # Energiezustand als lesbarer Text (für Dashboard und FSM-Debugging)
+        - name: "WP Energiezustand Text"
+          unique_id: lgthermav_sensor_energiezustand_text
+          state: >-
+            {% set val = states('input_number.thermav_40010')|int(0) %}
+            {% set modes = {
+              0: 'Nicht verwendet',
+              1: 'Erzwungen Aus',
+              2: 'Normalbetrieb',
+              3: 'Empfehlung Ein (+2°C)',
+              4: 'Befehl Ein (WW 80°C)',
+              5: 'Befehl++ (+5°C, Heizstab)',
+              6: 'Empfehlung+ (+2°C)',
+              7: 'Energiesparen (-2°C)',
+              8: 'Superenergiespar (-5°C)'
+            } %}
+            {{ modes.get(val, 'Unbekannt') }}
+          icon: mdi:lightning-bolt-circle
+
+    # ---------------
+    # Binäre Sensoren
+    # ---------------
+    - binary_sensor:
+        # Heizstab aktiv (kombiniert Stufe 1 + Stufe 2)
+        - name: "WP Heizstab aktiv"
+          unique_id: lgthermav_sensor_heizstab_aktiv
+          state: >-
+            {{ is_state('binary_sensor.zusatzheizung_1_20011', 'on') or
+               is_state('binary_sensor.zusatzheizung_2_20012', 'on') }}
+          device_class: running
+          icon: mdi:heating-coil
+
+    # -------
+    # Selects
+    # -------
+    - select:
+        - name: "(40001) Betriebsmodus"
+          unique_id: lgthermav_select_40001
+          options: "{{ ['Manuell', 'AI'] }}"
+          state: >
+            {% set mapping = {4: "Manuell", 3: "AI"} %}
+            {% set raw = states('sensor.betriebsmodus_40001')|int(4) %}
+            {{ mapping.get(raw, "Manuell") }}
+          select_option:
+            - action: modbus.write_register
+              data:
+                hub: modbus_waveshare
+                unit: 1
+                address: 0
+                value: >
+                  {% set mapping = {"Manuell": 4, "AI": 3} %}
+                  {{ mapping[option] }}
+
+        - name: "(40002) Steuermethode"
+          unique_id: lgthermav_select_40002
+          options: "{{ ['Wasserauslass', 'Wassereinlass', 'Raumluft'] }}"
+          state: >
+            {% set mapping = {0: "Wasserauslass", 1: "Wassereinlass", 2: "Raumluft"} %}
+            {% set raw = states('sensor.steuermethode_40002')|int(0) %}
+            {{ mapping.get(raw, "Wasserauslass") }}
+          select_option:
+            - action: modbus.write_register
+              data:
+                hub: modbus_waveshare
+                unit: 1
+                address: 1
+                value: >
+                  {% set mapping = {"Wasserauslass": 0, "Wassereinlass": 1, "Raumluft": 2} %}
+                  {{ mapping[option] }}
+
+# Helpers
+  counter:
+    kompressor_takte:
+      name: "WP-Kompressor Takte"
+      initial: 0
+      step: 1
+      icon: mdi:counter
+      restore: true
+
+    grundfos_takte:
+      name: "Grundfos Takte"
+      initial: 0
+      step: 1
+      icon: mdi:counter
+      restore: true
+
+  input_button:
+    kompressor_takte_reset:
+      name: "WP-Kompressor Takte zurücksetzen"
+      icon: mdi:restore
+    
+    grundfos_takte_reset:
+      name: "Grundfos Takte zurücksetzen"
+      icon: mdi:restore
+
+  automation:
+    - alias: "Kompressor Start zählen"
+      id: kompressor_start_counter
+      trigger:
+        - platform: state
+          entity_id: binary_sensor.kompressor_20004
+          from: "off"
+          to: "on"
+      action:
+        - action: counter.increment
+          target:
+            entity_id: counter.kompressor_takte
+      mode: single
+
+    - alias: "Kompressor Starts Reset"
+      id: kompressor_start_counter_reset
+      trigger:
+        - platform: state
+          entity_id: input_button.kompressor_takte_reset
+      action:
+        - action: counter.reset
+          target:
+            entity_id: counter.kompressor_takte
+      mode: single
+    
+    - alias: "Grundfos Start zählen"
+      id: grundfos_start_counter
+      trigger:
+        - platform: state
+          entity_id: switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+          from: "off"
+          to: "on"
+      action:
+        - action: counter.increment
+          target:
+            entity_id: counter.grundfos_takte
+      mode: single
+
+    - alias: "Grundfos Starts Reset"
+      id: grundfos_start_counter_reset
+      trigger:
+        - platform: state
+          entity_id: input_button.grundfos_takte_reset
+      action:
+        - action: counter.reset
+          target:
+            entity_id: counter.grundfos_takte
+      mode: single
