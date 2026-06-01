@@ -1,0 +1,70 @@
+hello_world:
+  module: hello
+  class: HelloWorld
+
+# ============================================================
+# AppDaemon Apps-Konfiguration
+# Liegt in: /conf/apps/apps.yaml
+# ============================================================
+
+heatpump_fsm:
+  module: heatpump_fsm
+  class: HeatpumpFSM
+  ha_param_prefix: "input_number.hp_"
+
+  # ── Sensoren ────────────────────────────────────────────────
+  # 1h-Mittelwert verhindert FSM-Takt bei AT-Flackern um den Schwellenwert
+  sensor_outdoor_temp:    sensor.aussentemperatur_mittelwert_1h
+  sensor_pv_power_w:      sensor.pv_produktion_15m
+  sensor_pv_energy_kwh:   sensor.home_energy_production_today_remaining
+  sensor_flow_temp:       sensor.hp_temp_sensors_2036e1_heizung_vl
+  sensor_return_temp:     sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
+  sensor_wp_leaving_temp: sensor.hp_temp_sensors_2036e1_hydrobox_auslauf_zu_tank
+  sensor_buffer_bottom:   sensor.hp_temp_sensors_2036e1_tank_1_4
+  sensor_buffer_mid:      sensor.hp_temp_sensors_2036e1_tank_2_4
+  sensor_buffer_mid_high: sensor.hp_temp_sensors_2036e1_tank_3_4
+  sensor_buffer_top:      sensor.hp_temp_sensors_2036e1_tank_4_4
+  # Wassereinlass WP (Modbus 30003) - Regelgroesse bei 40002=1 (Einlass-Regelung)
+  sensor_wp_inlet_temp:   sensor.wassereinlasstemperatur_30003
+
+  # ── Steuerung ───────────────────────────────────────────────
+  # Modbus-Hub fuer direkten Register-Write (40002 Steuermethode)
+  modbus_hub:               modbus_waveshare
+  modbus_slave:             1
+  switch_heating:           switch.heizungsschalter_10001
+  switch_hot_water:         switch.warmwasserschalter_10002
+  input_setpoint_circuit1:  input_number.thermav_40003
+  input_setpoint_circuit2:  input_number.thermav_40006
+  input_setpoint_ww:        input_number.thermav_40009
+  input_energy_state:       input_number.thermav_40010
+  binary_compressor:        binary_sensor.kompressor_20004
+  binary_wp_pump:           binary_sensor.umwalzpumpe_20002
+  binary_defrost:           binary_sensor.abtauen_20005
+  binary_aux_heater_1:      binary_sensor.zusatzheizung_1_20011
+  binary_aux_heater_2:      binary_sensor.zusatzheizung_2_20012
+  binary_werktag:           binary_sensor.werktag
+  cover_mixer:              cover.lg_thermav_circuit_2_1e6134_rl_mischer
+  mixer_full_travel_s:      123
+
+  # ── Grundfos Heizkreispumpe ──────────────────────────────────
+  switch_circuit2_pump:     switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+  switch_silent_mode:       switch.silent_mode_10003
+
+  # ── Heizstab-Boost ──────────────────────────────────────────
+  boost_window_start:     "10:00"
+  boost_window_end:       "18:00"
+
+  # ── Dry-Run ─────────────────────────────────────────────────
+  dry_run_entity:         input_boolean.hp_dry_run
+
+  # ── E-Stop: Takt-Schutz ─────────────────────────────────────
+  # Aktiviert dry_run wenn > estop_max_transitions Wechsel in estop_window_seconds
+  estop_entity:           input_boolean.hp_dry_run
+  estop_max_transitions:  10
+  estop_window_seconds:   5
+
+  # ── HA-Integration ──────────────────────────────────────────
+  input_select_entity:    input_select.heatpump_state
+  fire_events:            true
+  log_transitions:        true
+  event_prefix:           fsm_heatpump
