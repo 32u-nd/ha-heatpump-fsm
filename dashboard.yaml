@@ -1,0 +1,352 @@
+title: Wärmepumpe FSM
+views:
+  - title: WP Steuerung
+    path: wp-parameter
+    icon: mdi:heat-pump
+    cards:
+      - type: custom:mushroom-template-card
+        primary: FSM Zustand
+        secondary: '{{ states(''input_select.heatpump_state'') }}'
+        icon: >
+          {% set s = states('input_select.heatpump_state') %} {% if s ==
+          'heating' %} mdi:radiator {% elif s == 'heating_forced' %}
+          mdi:radiator-disabled {% elif s == 'hot_water' %} mdi:shower-head {%
+          elif s == 'buffer_charge' %} mdi:solar-power {% elif s ==
+          'buffer_charge_boost' %} mdi:lightning-bolt {% elif s ==
+          'buffer_drain' %} mdi:waves-arrow-right {% elif s == 'standby' %}
+          mdi:sleep {% else %} mdi:power-sleep {% endif %}
+        icon_color: >
+          {% set s = states('input_select.heatpump_state') %} {% if
+          is_state('input_boolean.hp_dry_run', 'on') %} purple {% elif s ==
+          'heating' %} orange {% elif s == 'heating_forced' %} deep-orange {%
+          elif s == 'hot_water' %} blue {% elif s == 'buffer_charge' %} green {%
+          elif s == 'buffer_charge_boost' %} amber {% elif s == 'buffer_drain'
+          %} cyan {% elif s == 'standby' %} grey {% else %} disabled {% endif %}
+        badge_icon: >
+          {% if is_state('input_boolean.hp_dry_run', 'on') %} mdi:test-tube {%
+          endif %}
+        badge_color: purple
+        entity: input_select.heatpump_state
+      - type: glance
+        title: 🌡️ Schlüsselwerte
+        columns: 4
+        show_name: true
+        show_icon: true
+        show_state: true
+        entities:
+          - entity: sensor.wassereinlasstemperatur_30003
+            name: WP-Einlass
+            icon: mdi:thermometer-chevron-down
+          - entity: sensor.wasserauslasstemperatur_30004
+            name: WP-Auslass
+            icon: mdi:thermometer-chevron-up
+          - entity: sensor.hp_temp_sensors_2036e1_heizung_vl
+            name: VL Heizung
+            icon: mdi:thermometer-water
+          - entity: sensor.aussentemperatur_mittelwert_1h
+            name: AT (1h)
+            icon: mdi:thermometer
+          - entity: sensor.pv_produktion_15m
+            name: PV (15m)
+            icon: mdi:solar-power
+          - entity: sensor.energiezahler_it_schaltschrank_leistung_warmepumpe
+            name: WP-Leistung
+            icon: mdi:lightning-bolt
+          - entity: sensor.hp_temp_sensors_2036e1_tank_4_4
+            name: Puffer Oben
+            icon: mdi:thermometer-chevron-up
+          - entity: sensor.hp_temp_sensors_2036e1_tank_1_4
+            name: Puffer Unten
+            icon: mdi:thermometer-chevron-down
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            entity: sensor.hp_temp_sensors_2036e1_tank_4_4
+            name: Oben (WW)
+            min: 20
+            max: 70
+            needle: true
+            segments:
+              - from: 0
+                color: '#BF3B37'
+              - from: 40
+                color: '#FCCF49'
+              - from: 50
+                color: '#3B875E'
+          - type: gauge
+            entity: sensor.hp_temp_sensors_2036e1_tank_3_4
+            name: 3/4
+            min: 20
+            max: 70
+            needle: true
+            segments:
+              - from: 0
+                color: '#BF3B37'
+              - from: 36
+                color: '#FCCF49'
+              - from: 44
+                color: '#3B875E'
+          - type: gauge
+            entity: sensor.hp_temp_sensors_2036e1_tank_2_4
+            name: 1/2 (VL)
+            min: 20
+            max: 70
+            needle: true
+            segments:
+              - from: 0
+                color: '#BF3B37'
+              - from: 36
+                color: '#FCCF49'
+              - from: 46
+                color: '#3B875E'
+          - type: gauge
+            entity: sensor.hp_temp_sensors_2036e1_tank_1_4
+            name: 1/4 (unten)
+            min: 20
+            max: 70
+            needle: true
+            segments:
+              - from: 0
+                color: '#BF3B37'
+              - from: 30
+                color: '#FCCF49'
+              - from: 36
+                color: '#3B875E'
+      - type: entities
+        title: 🔄 Betriebsstatus
+        show_header_toggle: false
+        entities:
+          - entity: input_select.heatpump_state
+            name: FSM Zustand (manuell)
+            icon: mdi:state-machine
+          - entity: input_boolean.hp_dry_run
+            name: Simulationsmodus (Dry-Run)
+            icon: mdi:test-tube
+          - entity: sensor.wp_energiezustand_text
+            name: Energiezustand (40010)
+            icon: mdi:lightning-bolt-circle
+          - entity: select.40002_steuermethode
+            name: Steuermethode (40002)
+            icon: mdi:swap-horizontal
+          - type: section
+            label: Komponenten
+          - entity: binary_sensor.kompressor_20004
+            name: Kompressor
+            icon: mdi:engine
+          - entity: binary_sensor.umwalzpumpe_20002
+            name: Umwälzpumpe intern
+          - entity: switch.heizungsschalter_10001
+            name: Heizung (10001)
+            icon: mdi:radiator
+          - entity: switch.warmwasserschalter_10002
+            name: Warmwasser (10002)
+            icon: mdi:water-boiler
+          - entity: switch.silent_mode_10003
+            name: Silent Mode
+            icon: mdi:volume-off
+          - entity: switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+            name: Grundfos Pumpe (Kreis 2)
+            icon: mdi:pump
+          - entity: binary_sensor.abtauen_20005
+            name: Abtauen
+            icon: mdi:snowflake-melt
+          - entity: binary_sensor.zusatzheizung_1_20011
+            name: Heizstab Stufe 1 (3 kW)
+            icon: mdi:heating-coil
+          - entity: binary_sensor.zusatzheizung_2_20012
+            name: Heizstab Stufe 2 (6 kW)
+            icon: mdi:heating-coil
+          - type: section
+            label: Mischer
+          - entity: cover.lg_thermav_circuit_2_1e6134_rl_mischer
+            name: Mischersteuerung
+            icon: mdi:valve
+          - entity: sensor.mischer_ist_position
+            name: Mischer Ist
+            icon: mdi:valve
+          - entity: input_number.hp_mischer_pi_position
+            name: Mischer Soll (PI)
+            icon: mdi:valve-open
+          - entity: input_number.hp_mixer_kp
+            name: Kp (Proportional)
+            mode: slider
+          - entity: input_number.hp_mixer_ki
+            name: Ki (Integral)
+            mode: slider
+          - entity: input_number.hp_mixer_interval_s
+            name: Regelzyklus (s)
+            mode: slider
+          - entity: input_number.hp_mixer_max_step_pct
+            name: Max-Schritt/Zyklus (%)
+            mode: slider
+          - type: section
+            label: Hydrobox & Druck
+          - entity: sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
+            name: Hydrobox Einlauf
+            icon: mdi:thermometer-chevron-down
+          - entity: sensor.hp_temp_sensors_2036e1_hydrobox_auslauf_zu_tank
+            name: Hydrobox Auslauf → Tank
+            icon: mdi:thermometer-chevron-up
+          - entity: sensor.hp_temp_sensors_2036e1_heizung_vl
+            name: Heizung VL
+            icon: mdi:thermometer-water
+          - entity: sensor.hp_temp_sensors_2036e1_heizung_rl
+            name: Heizung RL
+            icon: mdi:thermometer-water
+          - entity: sensor.wasserdruck_30014
+            name: Wasserdruck
+            icon: mdi:gauge
+      - type: entities
+        title: 📈 Heizkurve
+        show_header_toggle: false
+        entities:
+          - entity: input_number.hp_heat_curve_at_high
+            name: AT Heizgrenze
+            mode: slider
+          - entity: input_number.hp_heat_curve_vl_high
+            name: VL bei AT Heizgrenze
+            mode: slider
+          - entity: input_number.hp_heat_curve_at_low
+            name: AT Auslegung
+            mode: slider
+          - entity: input_number.hp_heat_curve_vl_low
+            name: VL bei AT Auslegung
+            mode: slider
+          - entity: input_number.hp_pv_correction_per_kw
+            name: PV-Korrektur pro kW
+            mode: slider
+          - entity: input_number.hp_circuit1_offset
+            name: Offset Kreis 1
+            mode: slider
+          - type: section
+            label: Berechnete Sollwerte (aktuell)
+          - entity: sensor.heizkurve_sollwert_kreis_2
+            name: Kreis 2
+            icon: mdi:thermometer-water
+          - entity: sensor.heizkurve_sollwert_kreis_1
+            name: Kreis 1
+            icon: mdi:thermometer-chevron-up
+          - type: section
+            label: Modbus-Register (letzter Schreibwert)
+          - entity: input_number.thermav_40003
+            name: Modbus Kreis 1 (40003)
+            mode: slider
+          - entity: input_number.thermav_40006
+            name: Modbus Kreis 2 (40006)
+            mode: slider
+      - type: entities
+        title: 🛢️ Schwellwerte, WW & PV-Laden
+        show_header_toggle: false
+        entities:
+          - type: section
+            label: Heizung (Puffer-Hysterese)
+          - entity: input_number.hp_heating_threshold
+            name: Heizgrenze AT
+            mode: slider
+          - entity: input_number.hp_buffer_drain_margin
+            name: 'Puffer-Drain Abstand zum Sollwert'
+            mode: slider
+          - entity: input_number.hp_buffer_drain_hyst
+            name: 'Puffer-Drain Hysterese (Totband)'
+            mode: slider
+          - type: section
+            label: Warmwasser
+          - entity: input_number.hp_ww_target_temp
+            name: WW-Soll
+            mode: slider
+          - entity: binary_sensor.werktag
+            name: Werktag
+            icon: mdi:calendar-today
+          - entity: input_datetime.hp_hw_morning_weekday
+            name: Morgens Mo–Fr
+            icon: mdi:clock-start
+          - entity: input_datetime.hp_hw_morning_weekend
+            name: Morgens Sa–So
+            icon: mdi:clock-start
+          - entity: input_datetime.hp_hw_evening
+            name: Abends (täglich)
+            icon: mdi:clock-end
+          - entity: input_number.hp_hw_duration_minutes
+            name: WW-Fensterdauer
+            mode: slider
+          - type: section
+            label: PV-Pufferladung (40002=1 · Einlass-Regelung)
+          - entity: sensor.wassereinlasstemperatur_30003
+            name: WP-Einlass Ist (30003)
+            icon: mdi:thermometer-chevron-down
+          - entity: input_number.hp_buffer_charge_inlet_temp
+            name: WP-Einlass Ziel
+            mode: slider
+            icon: mdi:thermometer-water
+          - entity: input_number.hp_buffer_charge_hyst
+            name: Hysterese Neustart
+            mode: slider
+            icon: mdi:thermometer-minus
+          - entity: input_number.hp_buffer_charge_min_minutes
+            name: Mindestlaufzeit Ausstieg
+            mode: slider
+            icon: mdi:timer-outline
+          - entity: input_number.hp_pv_buffer_min_kwh
+            name: PV-Restmenge über
+            mode: slider
+          - entity: input_number.hp_pv_buffer_max_kwh
+            name: PV-Restmenge unter
+            mode: slider
+          - entity: sensor.home_energy_production_today_remaining
+            name: PV-Restmenge (Prognose)
+            icon: mdi:solar-power-variant
+      - type: entities
+        title: ⚡ Heizstab-Boost
+        show_header_toggle: false
+        entities:
+          - entity: input_number.hp_boost_inlet_temp
+            name: WP-Einlass Ziel
+            mode: slider
+            icon: mdi:thermometer-plus
+          - entity: input_number.hp_boost_inlet_min_c
+            name: Mindest-Einlass vor Boost-Start
+            mode: slider
+            icon: mdi:thermometer-water
+          - entity: input_select.hp_boost_energy_state
+            name: Energiezustand (Register 40010)
+            icon: mdi:lightning-bolt-circle
+          - entity: input_number.hp_boost_pv_min_w
+            name: 'AN: PV mindestens'
+            mode: slider
+            icon: mdi:solar-power
+          - entity: input_number.hp_boost_pv_off_w
+            name: 'AUS: PV unter'
+            mode: slider
+            icon: mdi:solar-power-variant-outline
+          - type: custom:template-entity-row
+            entity: input_select.heatpump_state
+            name: Zeitfenster (apps.yaml)
+            state: 10:00 – 18:00 Uhr
+            icon: mdi:clock-outline
+      - type: entities
+        title: ⚙️ Verdichterschutz
+        show_header_toggle: false
+        entities:
+          - type: section
+            label: Verdichterschutz & Mindestlaufzeit
+          - entity: input_number.hp_standby_minutes
+            name: Standby-Pause
+            mode: slider
+          - entity: input_number.hp_min_runtime_minutes
+            name: Mindestlaufzeit Kompressor
+            mode: slider
+          - entity: input_number.hp_cycling_window_minutes
+            name: Takt-Schutz Fenster (min)
+            mode: slider
+          - entity: input_number.hp_cycling_max_starts
+            name: Takt-Schutz Max-Starts
+            mode: slider
+          - entity: input_number.hp_forced_setpoint_offset
+            name: Sollwert-Offset (heating_forced)
+            mode: slider
+          - entity: input_number.hp_forced_lp_alpha
+            name: Low-Pass Alpha (heating_forced)
+            mode: slider
+          - entity: input_number.hp_forced_setpoint_max_c
+            name: Sollwert-Obergrenze (heating_forced)
+            mode: slider
