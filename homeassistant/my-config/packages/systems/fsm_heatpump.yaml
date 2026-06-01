@@ -1,0 +1,568 @@
+fsm_heatpump:
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Wärmepumpen-FSM – HA-Parametrierung
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  # ── Gleitender Mittelwert Außentemperatur ─────────────────────────────────────
+  # Verhindert FSM-Takt wenn AT um den Heizschwellenwert flackert.
+  # Entity-ID: sensor.aussenlufttemperatur_1h_mittelwert
+  sensor:
+    - platform: statistics
+      name: "Außentemperatur Mittelwert 1h"
+      unique_id: sensor_aussentemperatur_mittelwert_1h
+      entity_id: sensor.aussentemperatur_mittelwert
+      state_characteristic: mean
+      max_age:
+        hours: 1
+      sampling_size: 120
+      precision: 1
+
+  input_number:
+    # ── Heizkurve ──────────────────────────────────────────────────────────────
+    hp_heat_curve_at_high:
+      name: "Heizkurve AT oberer Stützpunkt (Heizgrenze)"
+      min: 10
+      max: 22
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-chevron-up
+      mode: slider
+      initial: 16
+
+    hp_heat_curve_vl_high:
+      name: "Heizkurve VL bei AT hoch"
+      min: 20
+      max: 40
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: slider
+      initial: 27
+
+    hp_heat_curve_at_low:
+      name: "Heizkurve AT unterer Stützpunkt (Auslegung)"
+      min: -25
+      max: 0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-chevron-down
+      mode: slider
+      initial: -15
+
+    hp_heat_curve_vl_low:
+      name: "Heizkurve VL bei AT niedrig"
+      min: 25
+      max: 50
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: slider
+      initial: 40
+
+    hp_pv_correction_per_kw:
+      name: "PV-Korrektur pro kW"
+      min: 0
+      max: 1.0
+      step: 0.05
+      unit_of_measurement: "°C/kW"
+      icon: mdi:solar-power
+      mode: slider
+      initial: 0.2
+
+    # ── Pufferspeicher Schwellwerte ─────────────────────────────────────────────
+    hp_heating_threshold:
+      name: "Heizgrenze Außentemperatur"
+      min: 10
+      max: 20
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-lines
+      mode: slider
+      initial: 16
+
+    hp_buffer_drain_margin:
+      name: "Puffer-Drain Sicherheitsabstand zum Sollwert"
+      min: 1
+      max: 10
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:arrow-up-circle-outline
+      mode: slider
+      initial: 3
+
+    hp_buffer_drain_hyst:
+      name: "Puffer-Drain Hysterese (EIN/AUS-Totband)"
+      min: 0
+      max: 5
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:arrow-split-horizontal
+      mode: slider
+      initial: 2
+
+    hp_ww_target_temp:
+      name: "Warmwasser Solltemperatur"
+      min: 45
+      max: 60
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:water-thermometer
+      mode: slider
+      initial: 51
+
+    hp_buffer_charge_inlet_temp:
+      name: "PV-Ladung Einlass-Ziel (40002=1)"
+      min: 35
+      max: 60
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-water
+      mode: slider
+      initial: 50
+      # Mit 40002=1 (Wassereinlass-Regelung): WP laeuft bis Einlass (30003) >= X°C.
+      # Wenn Einlass = 50°C ist der gesamte Pufferspeicher >= 50°C (Schichtung).
+      # Ersetzt: hp_buffer_charge_on_temp, hp_buffer_charge_75pct, hp_buffer_charge_wp_offset.
+
+    hp_pv_buffer_min_kwh:
+      name: "PV-Restmenge Pufferladung – Minimum (EIN ab)"
+      min: 1
+      max: 15
+      step: 0.5
+      unit_of_measurement: "kWh"
+      icon: mdi:solar-power-variant
+      mode: slider
+      initial: 5
+
+    hp_pv_buffer_max_kwh:
+      name: "PV-Restmenge Pufferladung – Maximum (EIN bis)"
+      min: 5
+      max: 40
+      step: 0.5
+      unit_of_measurement: "kWh"
+      icon: mdi:solar-power-variant-outline
+      mode: slider
+      initial: 15
+      # Pufferladung startet nur wenn Tagesrest-kWh < dieser Wert.
+      # Beispiel: min=5, max=15 → Ladung startet wenn 5 ≤ Tagesrest < 15 kWh
+      # (also erst später am Nachmittag, nicht schon um 10 Uhr bei noch 25 kWh).
+      # Beim Verlassen des Zustands (AUS bei < min/2) bleibt diese Grenze ohne Wirkung.
+
+    # ── Heizstab-Boost ──────────────────────────────────────────────────────────
+    # Aktiviert sich automatisch aus buffer_charge wenn alle Bedingungen erfüllt sind.
+    # Die WP setzt Register 40010 (Energiezustand) auf boost_energy_state und erhöht
+    # den Kreis-1-Sollwert auf boost_target_temp. Der interne WP-Regler schaltet
+    # den Heizstab zu wenn die Solltemperatur allein nicht erreichbar ist.
+    # DIP-Schalter begrenzt Heizstab auf Stufe 1 = 3 kW.
+
+    hp_boost_inlet_temp:
+      name: "Boost Einlass-Ziel (40002=1)"
+      min: 45
+      max: 65
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-plus
+      mode: slider
+      initial: 55
+      # Einlass-Zieltemperatur fuer buffer_charge_boost (WP + Heizstab).
+      # Ersetzt: hp_boost_target_temp (Auslass-Ziel 65°C).
+
+    hp_boost_inlet_min_c:
+      name: "Boost Mindest-Einlass (Aktivierungsschwelle)"
+      min: 30
+      max: 55
+      step: 1
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-water
+      mode: slider
+      initial: 45
+      # Boost startet erst wenn Einlass (30003) >= X°C.
+      # Verhindert Boost-Aktivierung bei noch kaltem Puffer.
+      # Sollte < hp_buffer_charge_inlet_temp (50°C) sein, damit Boost
+      # noch waehrend buffer_charge aktiv werden kann.
+      # Ersetzt: hp_boost_return_min_c (Ruecklauf-Schwelle 50°C).
+
+    hp_buffer_charge_min_minutes:
+      name: "Pufferladung Mindestlaufzeit (Ausstieg)"
+      min: 2
+      max: 20
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+      initial: 5
+      # Verhindert Fehlausstieg durch heisses Rohrrestwasser im Sommerbetrieb:
+      # WP-interne Pumpe liest ~52°C Restwasser direkt nach Start -> exit waere falsch.
+      # Temperaturbasierter Ausstieg erst nach dieser Mindestlaufzeit moeglich.
+
+    hp_buffer_charge_hyst:
+      name: "Pufferladung Hysterese (Neustart-Schwelle)"
+      min: 1
+      max: 10
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-minus
+      mode: slider
+      initial: 5
+      # Neustart der Pufferladung erst wenn Einlass unter
+      # (hp_buffer_charge_inlet_temp - hp_buffer_charge_hyst) faellt.
+      # Verhindert Takt-Neustart wenn Einlass nach WP-Stopp knapp
+      # unter die Zieltemperatur faellt (z.B. 49.4 < 50°C).
+
+    hp_boost_pv_min_w:
+      name: "Boost PV-Mindestleistung (EIN)"
+      min: 2000
+      max: 6000
+      step: 100
+      unit_of_measurement: "W"
+      icon: mdi:solar-power
+      mode: slider
+      initial: 3500
+      # PV muss > X W liefern (Heizstab 3kW + WP-Eigenbedarf ~1-2kW)
+
+    hp_boost_pv_off_w:
+      name: "Boost PV-Abschaltleistung (Hysterese)"
+      min: 0
+      max: 5000
+      step: 100
+      unit_of_measurement: "W"
+      icon: mdi:solar-power-variant-outline
+      mode: slider
+      initial: 1500
+      # Boost wird beendet wenn PV < X W (Hysterese zu boost_pv_min_w)
+
+    # ── Warmwasser-Zeiten ───────────────────────────────────────────────────────
+    hp_hw_duration_minutes:
+      name: "WW Fensterdauer"
+      min: 15
+      max: 120
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+      initial: 60
+
+    # ── PI-Regler Mischer ───────────────────────────────────────────────────────
+    hp_mixer_kp:
+      name: "Mischer Kp (proportional)"
+      min: 0.0
+      max: 2.0
+      step: 0.1
+      unit_of_measurement: "%pt/°C"
+      icon: mdi:tune-vertical
+      mode: slider
+      initial: 0.5
+
+    hp_mixer_ki:
+      name: "Mischer Ki (integral)"
+      min: 0.0
+      max: 2.0
+      step: 0.1
+      unit_of_measurement: "%pt/°C"
+      icon: mdi:tune-vertical-variant
+      mode: slider
+      initial: 0.1
+
+    hp_mixer_interval_s:
+      name: "Mischer Regelzyklus"
+      min: 0
+      max: 30
+      step: 5
+      unit_of_measurement: "s"
+      icon: mdi:timer
+      mode: slider
+      initial: 5
+
+    hp_mixer_max_step_pct:
+      name: "Mischer Max-Schritt pro Zyklus"
+      min: 1
+      max: 20
+      step: 0.5
+      unit_of_measurement: "%"
+      icon: mdi:chevron-double-up
+      mode: slider
+      initial: 4
+
+    hp_mixer_warmstart_position:
+      name: "Mischer Warmstart-Position"
+      min: 0
+      max: 50
+      step: 5
+      unit_of_measurement: "%"
+      icon: mdi:valve-open
+      mode: slider
+      initial: 20
+
+    # ── Mindestlaufzeit & Verdichterschutz ─────────────────────────────────────
+    hp_min_runtime_minutes:
+      name: "Mindestlaufzeit Kompressor"
+      min: 10
+      max: 90
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-check
+      mode: slider
+      initial: 45
+
+    hp_standby_minutes:
+      name: "Verdichterschutz-Pause"
+      min: 1
+      max: 10
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:shield-half-full
+      mode: slider
+      initial: 3
+
+    hp_cycling_window_minutes:
+      name: "Takt-Schutz Beobachtungsfenster"
+      min: 30
+      max: 120
+      step: 10
+      unit_of_measurement: "min"
+      icon: mdi:timer-alert
+      mode: slider
+      initial: 60
+
+    hp_cycling_max_starts:
+      name: "Takt-Schutz Max-Starts im Fenster"
+      min: 3
+      max: 12
+      step: 1
+      unit_of_measurement: ""
+      icon: mdi:counter
+      mode: slider
+      initial: 6
+
+    hp_forced_setpoint_offset:
+      name: "Mindestlaufzeit Sollwert-Offset"
+      min: 0.0
+      max: 5.0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-plus
+      mode: slider
+      initial: 1
+
+    hp_forced_lp_alpha:
+      name: "Mindestlaufzeit Low-Pass Alpha"
+      min: 0.05
+      max: 1.0
+      step: 0.05
+      unit_of_measurement: ""
+      icon: mdi:filter
+      mode: slider
+      initial: 0.2
+
+    hp_forced_setpoint_max_c:
+      name: "Mindestlaufzeit Sollwert-Obergrenze"
+      min: 35
+      max: 60
+      step: 1
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-alert
+      mode: slider
+      initial: 50
+
+    # ── LG ThermaV Kreis-Offset ────────────────────────────────────────────────
+    hp_circuit1_offset:
+      name: "Kreis 1 Offset gegenüber Kreis 2"
+      min: 0.0
+      max: 5.0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:swap-vertical
+      mode: slider
+      initial: 1
+
+    # ── Dashboard-Visualisierung (read-only, AppDaemon schreibt) ───────────────
+    hp_mischer_pi_position:
+      name: "Mischer PI-Soll-Position"
+      min: 0
+      max: 100
+      step: 0.1
+      unit_of_measurement: "%"
+      icon: mdi:valve
+      mode: slider
+
+  # Hinweis: Die Standardwerte stehen direkt am jeweiligen input_number (Feld `initial:`).
+  # Der frueher hier gepflegte separate Kommentarblock war veraltet/widerspruechlich
+  # und wurde entfernt - einzige Quelle der Wahrheit sind die `initial:`-Felder oben
+  # bzw. das _DEFAULTS-Dict in heatpump_fsm.py.
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Dry-Run / Simulationsmodus
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  input_boolean:
+    hp_dry_run:
+      name: "WP FSM Simulationsmodus (Dry-Run)"
+      icon: mdi:test-tube
+      # EIN: FSM rechnet alles durch, kein Modbus-Write
+      # AUS: Normalbetrieb
+
+  input_datetime:
+    hp_hw_morning_weekday:
+      name: "WW Morgens Werktag (Mo–Fr)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-start
+
+    hp_hw_morning_weekend:
+      name: "WW Morgens Wochenende (Sa–So)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-start
+
+    hp_hw_evening:
+      name: "WW Abends (täglich)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-end
+
+  input_select:
+    hp_boost_energy_state:
+      name: "Boost Energiezustand (Register 40010)"
+      icon: mdi:lightning-bolt-circle
+      options:
+        - "3 – Empfehlung Ein (+2°C)"
+        - "4 – Befehl Ein (WW 80°C)"
+        - "5 – Befehl++ (+5°C, Heizstab)"
+        - "6 – Empfehlung+ (+2°C)"
+        - "7 – Energiesparen (-2°C)"
+        - "8 – Superenergiespar (-5°C)"
+      initial: "5 – Befehl++ (+5°C, Heizstab)"
+
+    heatpump_state:
+      name: "Wärmepumpe FSM Zustand"
+      options:
+        - idle
+        - heating
+        - heating_forced
+        - hot_water
+        - buffer_charge
+        - buffer_charge_boost
+        - buffer_drain
+        - standby
+      initial: idle
+      icon: mdi:state-machine
+
+  template:
+    - sensor:
+        - name: "Mischer Ist-Position"
+          unique_id: fsm_sensor_mischer_ist_position
+          unit_of_measurement: "%"
+          icon: mdi:valve
+          state: >
+            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') | int(0) }}
+
+        - name: "Heizkurve Sollwert Kreis 2"
+          unique_id: fsm_sensor_sollwert_kreis2
+          unit_of_measurement: "°C"
+          icon: mdi:thermometer-water
+          state_class: measurement
+          state: >
+            {% set at_high = states('input_number.hp_heat_curve_at_high') | float(16) %}
+            {% set vl_high = states('input_number.hp_heat_curve_vl_high') | float(27) %}
+            {% set at_low  = states('input_number.hp_heat_curve_at_low')  | float(-15) %}
+            {% set vl_low  = states('input_number.hp_heat_curve_vl_low')  | float(40) %}
+            {% set at      = states('sensor.aussentemperatur_mittelwert_1h') | float(10) %}
+            {% set pv_kw   = states('sensor.pv_produktion_15m') | float(0) / 1000 %}
+            {% set corr    = states('input_number.hp_pv_correction_per_kw') | float(0.2) %}
+            {% set slope   = (vl_low - vl_high) / (at_high - at_low) %}
+            {% set base    = vl_high + (at_high - at) * slope %}
+            {{ [18.0, [60.0, (base - pv_kw * corr)] | min] | max | round(1) }}
+
+        - name: "Heizkurve Sollwert Kreis 1"
+          unique_id: fsm_sensor_sollwert_kreis1
+          unit_of_measurement: "°C"
+          icon: mdi:thermometer-chevron-up
+          state_class: measurement
+          state: >
+            {% set kreis2 = states('sensor.heizkurve_sollwert_kreis_2') | float(0) %}
+            {% set offset = states('input_number.hp_circuit1_offset') | float(1) %}
+            {{ (kreis2 + offset) | round(1) }}
+
+        - name: "Außentemperatur Mittelwert"
+          unique_id: sensor_aussentemperatur_mittelwert
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          state: >
+            {% set sensors = [
+              'sensor.0xa4c1388f78310575_temperature',
+              'sensor.aussenlufttemperatur_30013',
+              'sensor.open_meteo_temperatur'
+            ] %}
+            {% set values = namespace(list=[]) %}
+            {% for s in sensors %}
+              {% set v = states(s) %}
+              {% if v not in ['unavailable', 'unknown', 'none', ''] %}
+                {% set values.list = values.list + [v | float] %}
+              {% endif %}
+            {% endfor %}
+            {% if values.list | count > 0 %}
+              {{ (values.list | sum / values.list | count) | round(1) }}
+            {% else %}
+              unavailable
+            {% endif %}
+
+    - binary_sensor:
+        - name: "Werktag"
+          unique_id: binary_werktag
+          state: >
+            {{ now().weekday() < 5
+              and not is_state('calendar.feiertage_niedersachsen', 'on') }}
+          device_class: running
+          icon: mdi:calendar-today
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Modbus-Automation
+  # ═══════════════════════════════════════════════════════════════════════════════
+  automation:
+    - alias: "Modbus: Solltemperatur Kreis 1 (40003)"
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40003
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 2
+            value: "{{ (states('input_number.thermav_40003') | float * 10) | int }}"
+
+    - alias: "Modbus: Solltemperatur Kreis 2 (40006)"
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40006
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 5
+            value: "{{ (states('input_number.thermav_40006') | float * 10) | int }}"
+
+    - alias: "Modbus: WW-Solltemperatur (40009)"
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40009
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 8
+            value: "{{ (states('input_number.thermav_40009') | float * 10) | int }}"
+
+    - alias: "Modbus: Energiezustand (40010)"
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40010
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 9
+            value: "{{ states('input_number.thermav_40010') | int }}"
