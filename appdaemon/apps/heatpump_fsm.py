@@ -1707,8 +1707,9 @@ class HeatpumpFSM(FSMBase):
         min_elapsed = (
             self._compressor_runtime_minutes() >= self._min_runtime_minutes
         )
-        # LP-Untergrenze: Kreis1 soll nie unter den Heizkurven-Sollwert fallen
-        lp_floor = curve_sp - self._forced_setpoint_offset - self._circuit1_offset
+        # LP-Untergrenze so dass Kreis1 = curve_sp + circuit1_offset wenn LP = lp_floor:
+        # raw_c1 = lp_floor + forced_setpoint_offset + circuit1_offset = curve_sp + circuit1_offset
+        lp_floor = curve_sp - self._forced_setpoint_offset
 
         if self._forced_lp_value is None:
             # Init: LP mindestens so hoch dass Kreis1 >= Kurve
