@@ -191,6 +191,13 @@ class FSMBase(hass.Hass):
                 f"[FSM] Initial-Enter uebersprungen (Transition kam zuerst, Zustand: {self._state})"
             )
             return
+        # Transitions zuerst pruefen: wenn eine sofort greift (z.B. Neustart in
+        # idle obwohl System eigentlich in buffer_drain laufen sollte), wird
+        # _initial_enter_done in _do_transition gesetzt und on_enter_idle
+        # (inkl. _mixer_full_close) wird nie ausgefuehrt.
+        self.evaluate_transitions()
+        if self._initial_enter_done:
+            return
         self._initial_enter_done = True
         self.log(f"[FSM] Fuehre on_enter_{self._state}() aus (Start-Sync)")
         self._is_restart_enter = True

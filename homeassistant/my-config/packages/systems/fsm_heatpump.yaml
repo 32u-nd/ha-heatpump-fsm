@@ -27,7 +27,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-chevron-up
       mode: slider
-      initial: 16
 
     hp_heat_curve_vl_high:
       name: "Heizkurve VL bei AT hoch"
@@ -37,7 +36,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer
       mode: slider
-      initial: 27
 
     hp_heat_curve_at_low:
       name: "Heizkurve AT unterer Stützpunkt (Auslegung)"
@@ -47,7 +45,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-chevron-down
       mode: slider
-      initial: -15
 
     hp_heat_curve_vl_low:
       name: "Heizkurve VL bei AT niedrig"
@@ -57,7 +54,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer
       mode: slider
-      initial: 40
 
     hp_pv_correction_per_kw:
       name: "PV-Korrektur pro kW"
@@ -67,19 +63,29 @@ fsm_heatpump:
       unit_of_measurement: "°C/kW"
       icon: mdi:solar-power
       mode: slider
-      initial: 0.2
+
+    # ── AT EMA Witterungsführung ────────────────────────────────────────────────
+    # Exponentielle Glättung der Außentemperatur (Zeitkonstante τ einstellbar).
+    # α = 1 − e^(−dt/τ), Update alle 5 min. Schwere Bauweise: τ ≈ 12–24 h.
+    hp_at_ema_tau_hours:
+      name: "AT EMA Zeitkonstante"
+      min: 1
+      max: 72
+      step: 1
+      unit_of_measurement: "h"
+      icon: mdi:timer-sand
+      mode: slider
+
+    hp_at_ema_value:
+      name: "AT EMA Wert (intern)"
+      min: -30
+      max: 40
+      step: 0.01
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: box
 
     # ── Pufferspeicher Schwellwerte ─────────────────────────────────────────────
-    hp_heating_threshold:
-      name: "Heizgrenze Außentemperatur"
-      min: 10
-      max: 20
-      step: 0.5
-      unit_of_measurement: "°C"
-      icon: mdi:thermometer-lines
-      mode: slider
-      initial: 16
-
     hp_buffer_drain_margin:
       name: "Puffer-Drain Sicherheitsabstand zum Sollwert"
       min: 1
@@ -88,7 +94,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:arrow-up-circle-outline
       mode: slider
-      initial: 3
 
     hp_buffer_drain_hyst:
       name: "Puffer-Drain Hysterese (EIN/AUS-Totband)"
@@ -98,7 +103,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:arrow-split-horizontal
       mode: slider
-      initial: 2
 
     hp_ww_target_temp:
       name: "Warmwasser Solltemperatur"
@@ -108,7 +112,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:water-thermometer
       mode: slider
-      initial: 51
 
     hp_buffer_charge_inlet_temp:
       name: "PV-Ladung Einlass-Ziel (40002=1)"
@@ -118,7 +121,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-water
       mode: slider
-      initial: 50
       # Mit 40002=1 (Wassereinlass-Regelung): WP laeuft bis Einlass (30003) >= X°C.
       # Wenn Einlass = 50°C ist der gesamte Pufferspeicher >= 50°C (Schichtung).
       # Ersetzt: hp_buffer_charge_on_temp, hp_buffer_charge_75pct, hp_buffer_charge_wp_offset.
@@ -131,7 +133,6 @@ fsm_heatpump:
       unit_of_measurement: "kWh"
       icon: mdi:solar-power-variant
       mode: slider
-      initial: 5
 
     hp_pv_buffer_max_kwh:
       name: "PV-Restmenge Pufferladung – Maximum (EIN bis)"
@@ -141,7 +142,6 @@ fsm_heatpump:
       unit_of_measurement: "kWh"
       icon: mdi:solar-power-variant-outline
       mode: slider
-      initial: 15
       # Pufferladung startet nur wenn Tagesrest-kWh < dieser Wert.
       # Beispiel: min=5, max=15 → Ladung startet wenn 5 ≤ Tagesrest < 15 kWh
       # (also erst später am Nachmittag, nicht schon um 10 Uhr bei noch 25 kWh).
@@ -162,7 +162,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-plus
       mode: slider
-      initial: 55
       # Einlass-Zieltemperatur fuer buffer_charge_boost (WP + Heizstab).
       # Ersetzt: hp_boost_target_temp (Auslass-Ziel 65°C).
 
@@ -174,7 +173,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-water
       mode: slider
-      initial: 45
       # Boost startet erst wenn Einlass (30003) >= X°C.
       # Verhindert Boost-Aktivierung bei noch kaltem Puffer.
       # Sollte < hp_buffer_charge_inlet_temp (50°C) sein, damit Boost
@@ -189,7 +187,6 @@ fsm_heatpump:
       unit_of_measurement: "min"
       icon: mdi:timer-outline
       mode: slider
-      initial: 5
       # Verhindert Fehlausstieg durch heisses Rohrrestwasser im Sommerbetrieb:
       # WP-interne Pumpe liest ~52°C Restwasser direkt nach Start -> exit waere falsch.
       # Temperaturbasierter Ausstieg erst nach dieser Mindestlaufzeit moeglich.
@@ -202,7 +199,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-minus
       mode: slider
-      initial: 5
       # Neustart der Pufferladung erst wenn Einlass unter
       # (hp_buffer_charge_inlet_temp - hp_buffer_charge_hyst) faellt.
       # Verhindert Takt-Neustart wenn Einlass nach WP-Stopp knapp
@@ -216,7 +212,6 @@ fsm_heatpump:
       unit_of_measurement: "W"
       icon: mdi:solar-power
       mode: slider
-      initial: 3500
       # PV muss > X W liefern (Heizstab 3kW + WP-Eigenbedarf ~1-2kW)
 
     hp_boost_pv_off_w:
@@ -227,7 +222,6 @@ fsm_heatpump:
       unit_of_measurement: "W"
       icon: mdi:solar-power-variant-outline
       mode: slider
-      initial: 1500
       # Boost wird beendet wenn PV < X W (Hysterese zu boost_pv_min_w)
 
     # ── Warmwasser-Zeiten ───────────────────────────────────────────────────────
@@ -239,7 +233,6 @@ fsm_heatpump:
       unit_of_measurement: "min"
       icon: mdi:timer-outline
       mode: slider
-      initial: 60
 
     # ── PI-Regler Mischer ───────────────────────────────────────────────────────
     hp_mixer_kp:
@@ -250,7 +243,6 @@ fsm_heatpump:
       unit_of_measurement: "%pt/°C"
       icon: mdi:tune-vertical
       mode: slider
-      initial: 0.5
 
     hp_mixer_ki:
       name: "Mischer Ki (integral)"
@@ -260,7 +252,6 @@ fsm_heatpump:
       unit_of_measurement: "%pt/°C"
       icon: mdi:tune-vertical-variant
       mode: slider
-      initial: 0.1
 
     hp_mixer_interval_s:
       name: "Mischer Regelzyklus"
@@ -270,7 +261,6 @@ fsm_heatpump:
       unit_of_measurement: "s"
       icon: mdi:timer
       mode: slider
-      initial: 5
 
     hp_mixer_max_step_pct:
       name: "Mischer Max-Schritt pro Zyklus"
@@ -280,7 +270,6 @@ fsm_heatpump:
       unit_of_measurement: "%"
       icon: mdi:chevron-double-up
       mode: slider
-      initial: 4
 
     hp_mixer_warmstart_position:
       name: "Mischer Warmstart-Position"
@@ -290,7 +279,6 @@ fsm_heatpump:
       unit_of_measurement: "%"
       icon: mdi:valve-open
       mode: slider
-      initial: 20
 
     # ── Mindestlaufzeit & Verdichterschutz ─────────────────────────────────────
     hp_min_runtime_minutes:
@@ -301,7 +289,6 @@ fsm_heatpump:
       unit_of_measurement: "min"
       icon: mdi:timer-check
       mode: slider
-      initial: 45
 
     hp_standby_minutes:
       name: "Verdichterschutz-Pause"
@@ -311,7 +298,6 @@ fsm_heatpump:
       unit_of_measurement: "min"
       icon: mdi:shield-half-full
       mode: slider
-      initial: 3
 
     hp_cycling_window_minutes:
       name: "Takt-Schutz Beobachtungsfenster"
@@ -321,7 +307,6 @@ fsm_heatpump:
       unit_of_measurement: "min"
       icon: mdi:timer-alert
       mode: slider
-      initial: 60
 
     hp_cycling_max_starts:
       name: "Takt-Schutz Max-Starts im Fenster"
@@ -331,7 +316,6 @@ fsm_heatpump:
       unit_of_measurement: ""
       icon: mdi:counter
       mode: slider
-      initial: 6
 
     hp_forced_setpoint_offset:
       name: "Mindestlaufzeit Sollwert-Offset"
@@ -341,7 +325,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-plus
       mode: slider
-      initial: 1
 
     hp_forced_lp_alpha:
       name: "Mindestlaufzeit Low-Pass Alpha"
@@ -351,19 +334,8 @@ fsm_heatpump:
       unit_of_measurement: ""
       icon: mdi:filter
       mode: slider
-      initial: 0.2
 
-    hp_forced_setpoint_max_c:
-      name: "Mindestlaufzeit Sollwert-Obergrenze"
-      min: 35
-      max: 60
-      step: 1
-      unit_of_measurement: "°C"
-      icon: mdi:thermometer-alert
-      mode: slider
-      initial: 50
-
-    # ── LG ThermaV Kreis-Offset ────────────────────────────────────────────────
+# ── LG ThermaV Kreis-Offset ────────────────────────────────────────────────
     hp_circuit1_offset:
       name: "Kreis 1 Offset gegenüber Kreis 2"
       min: 0.0
@@ -372,7 +344,6 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:swap-vertical
       mode: slider
-      initial: 1
 
     # ── Dashboard-Visualisierung (read-only, AppDaemon schreibt) ───────────────
     hp_mischer_pi_position:
@@ -384,10 +355,10 @@ fsm_heatpump:
       icon: mdi:valve
       mode: slider
 
-  # Hinweis: Die Standardwerte stehen direkt am jeweiligen input_number (Feld `initial:`).
-  # Der frueher hier gepflegte separate Kommentarblock war veraltet/widerspruechlich
-  # und wurde entfernt - einzige Quelle der Wahrheit sind die `initial:`-Felder oben
-  # bzw. das _DEFAULTS-Dict in heatpump_fsm.py.
+  # Hinweis: Kein `initial:` bei input_number/input_select – HA wuerde sonst bei jedem
+  # Neustart den gespeicherten Wert ueberschreiben (HA-Quellcode: if self._initial is not None: return).
+  # Standardwerte stehen im _DEFAULTS-Dict in heatpump_fsm.py und in SUMMARY.md.
+  # Erstinstallation: Entities starten als 'unknown', FSM nutzt _DEFAULTS als Fallback.
 
   # ═══════════════════════════════════════════════════════════════════════════════
   # Dry-Run / Simulationsmodus
@@ -430,7 +401,6 @@ fsm_heatpump:
         - "6 – Empfehlung+ (+2°C)"
         - "7 – Energiesparen (-2°C)"
         - "8 – Superenergiespar (-5°C)"
-      initial: "5 – Befehl++ (+5°C, Heizstab)"
 
     heatpump_state:
       name: "Wärmepumpe FSM Zustand"
@@ -443,7 +413,6 @@ fsm_heatpump:
         - buffer_charge_boost
         - buffer_drain
         - standby
-      initial: idle
       icon: mdi:state-machine
 
   template:
@@ -465,7 +434,7 @@ fsm_heatpump:
             {% set vl_high = states('input_number.hp_heat_curve_vl_high') | float(27) %}
             {% set at_low  = states('input_number.hp_heat_curve_at_low')  | float(-15) %}
             {% set vl_low  = states('input_number.hp_heat_curve_vl_low')  | float(40) %}
-            {% set at      = states('sensor.aussentemperatur_mittelwert_1h') | float(10) %}
+            {% set at      = states('sensor.aussentemperatur_ema') | float(10) %}
             {% set pv_kw   = states('sensor.pv_produktion_15m') | float(0) / 1000 %}
             {% set corr    = states('input_number.hp_pv_correction_per_kw') | float(0.2) %}
             {% set slope   = (vl_low - vl_high) / (at_high - at_low) %}
@@ -505,6 +474,17 @@ fsm_heatpump:
             {% else %}
               unavailable
             {% endif %}
+
+        - name: "Außentemperatur EMA"
+          unique_id: fsm_sensor_at_ema
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          icon: mdi:thermometer-lines
+          state: >
+            {% set v = states('input_number.hp_at_ema_value') %}
+            {% if v in ('unknown', 'unavailable') %}{{ none }}
+            {% else %}{{ v | float | round(1) }}{% endif %}
 
     - binary_sensor:
         - name: "Werktag"
@@ -566,3 +546,33 @@ fsm_heatpump:
             slave: 1
             address: 9
             value: "{{ states('input_number.thermav_40010') | int }}"
+
+    - alias: "AT EMA Update (alle 5 Minuten)"
+      triggers:
+        - trigger: time_pattern
+          minutes: "/5"
+      actions:
+        - variables:
+            at_now: "{{ states('sensor.aussentemperatur_mittelwert') | float(99) }}"
+            ema_prev: "{{ states('input_number.hp_at_ema_value') | float(99) }}"
+            tau_h: "{{ states('input_number.hp_at_ema_tau_hours') | float(24) }}"
+        - condition: template
+          value_template: "{{ at_now | abs < 90 }}"
+        - choose:
+            - conditions: "{{ ema_prev >= 90 }}"
+              # Entity unbekannt/unavailable: Erst-Deploy oder kein gespeicherter Zustand.
+              # Tritt nur auf wenn initial: fehlt und noch kein Wert gespeichert wurde.
+              sequence:
+                - action: input_number.set_value
+                  target:
+                    entity_id: input_number.hp_at_ema_value
+                  data:
+                    value: "{{ at_now | round(2) }}"
+          default:
+            - variables:
+                alpha: "{{ 1 - 2.718281828 ** (-(5.0 / 60.0) / tau_h) }}"
+            - action: input_number.set_value
+              target:
+                entity_id: input_number.hp_at_ema_value
+              data:
+                value: "{{ (alpha * at_now + (1 - alpha) * ema_prev) | round(2) }}"

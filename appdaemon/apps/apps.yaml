@@ -13,10 +13,11 @@ heatpump_fsm:
   ha_param_prefix: "input_number.hp_"
 
   # ── Sensoren ────────────────────────────────────────────────
-  # 1h-Mittelwert verhindert FSM-Takt bei AT-Flackern um den Schwellenwert
-  sensor_outdoor_temp:    sensor.aussentemperatur_mittelwert_1h
+  # EMA (τ=24h default) dämpft AT-Flackern; Zeitkonstante per Dashboard einstellbar
+  sensor_outdoor_temp:    sensor.aussentemperatur_ema
+  sensor_outdoor_temp_1h: sensor.aussentemperatur_mittelwert_1h
   sensor_pv_power_w:      sensor.pv_produktion_15m
-  sensor_pv_energy_kwh:   sensor.home_energy_production_today_remaining
+  sensor_pv_energy_kwh:   sensor.energy_production_today_remaining
   sensor_flow_temp:       sensor.hp_temp_sensors_2036e1_heizung_vl
   sensor_return_temp:     sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
   sensor_wp_leaving_temp: sensor.hp_temp_sensors_2036e1_hydrobox_auslauf_zu_tank

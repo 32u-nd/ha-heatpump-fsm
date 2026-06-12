@@ -6,7 +6,7 @@ views:
     cards:
       - type: custom:mushroom-template-card
         primary: FSM Zustand
-        secondary: '{{ states(''input_select.heatpump_state'') }}'
+        secondary: "{{ states('input_select.heatpump_state') }}"
         icon: >
           {% set s = states('input_select.heatpump_state') %} {% if s ==
           'heating' %} mdi:radiator {% elif s == 'heating_forced' %}
@@ -46,18 +46,17 @@ views:
           - entity: sensor.aussentemperatur_mittelwert_1h
             name: AT (1h)
             icon: mdi:thermometer
+          - entity: sensor.aussentemperatur_ema
+            name: AT (EWMA)
+            icon: mdi:thermometer-lines
           - entity: sensor.pv_produktion_15m
             name: PV (15m)
             icon: mdi:solar-power
           - entity: sensor.energiezahler_it_schaltschrank_leistung_warmepumpe
             name: WP-Leistung
             icon: mdi:lightning-bolt
-          - entity: sensor.hp_temp_sensors_2036e1_tank_4_4
-            name: Puffer Oben
-            icon: mdi:thermometer-chevron-up
-          - entity: sensor.hp_temp_sensors_2036e1_tank_1_4
-            name: Puffer Unten
-            icon: mdi:thermometer-chevron-down
+          - entity: sensor.mischer_ist_position
+            name: Mischer
       - type: horizontal-stack
         cards:
           - type: gauge
@@ -68,11 +67,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: '#BF3B37'
+                color: "#BF3B37"
               - from: 40
-                color: '#FCCF49'
+                color: "#FCCF49"
               - from: 50
-                color: '#3B875E'
+                color: "#3B875E"
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_3_4
             name: 3/4
@@ -81,11 +80,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: '#BF3B37'
+                color: "#BF3B37"
               - from: 36
-                color: '#FCCF49'
+                color: "#FCCF49"
               - from: 44
-                color: '#3B875E'
+                color: "#3B875E"
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_2_4
             name: 1/2 (VL)
@@ -94,11 +93,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: '#BF3B37'
+                color: "#BF3B37"
               - from: 36
-                color: '#FCCF49'
+                color: "#FCCF49"
               - from: 46
-                color: '#3B875E'
+                color: "#3B875E"
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_1_4
             name: 1/4 (unten)
@@ -107,11 +106,67 @@ views:
             needle: true
             segments:
               - from: 0
-                color: '#BF3B37'
+                color: "#BF3B37"
               - from: 30
-                color: '#FCCF49'
+                color: "#FCCF49"
               - from: 36
-                color: '#3B875E'
+                color: "#3B875E"
+      - type: horizontal-stack
+        cards:
+          - type: gauge
+            entity: sensor.wp_arbeitszahl_15m_fallback
+            name: COP (15m)
+            unit: " "
+            min: 2.5
+            max: 5
+            needle: true
+            segments:
+              - from: 2.5
+                color: "#BF3B37"
+              - from: 3
+                color: "#FCCF49"
+              - from: 4
+                color: "#3B875E"
+          - type: gauge
+            entity: sensor.wp_arbeitszahl_1d_fallback
+            name: COP (1d)
+            unit: " "
+            min: 2.5
+            max: 5
+            needle: true
+            segments:
+              - from: 2.5
+                color: "#BF3B37"
+              - from: 3
+                color: "#FCCF49"
+              - from: 4
+                color: "#3B875E"
+          - type: gauge
+            entity: sensor.carnot_effizienz_15m_fallback
+            name: Carnot (15m)
+            min: 0
+            max: 100
+            needle: true
+            segments:
+              - from: 0
+                color: "#BF3B37"
+              - from: 40
+                color: "#FCCF49"
+              - from: 60
+                color: "#3B875E"
+          - type: gauge
+            entity: sensor.carnot_effizienz_1d_fallback
+            name: Carnot (1d)
+            min: 0
+            max: 100
+            needle: true
+            segments:
+              - from: 0
+                color: "#BF3B37"
+              - from: 40
+                color: "#FCCF49"
+              - from: 60
+                color: "#3B875E"
       - type: entities
         title: 🔄 Betriebsstatus
         show_header_toggle: false
@@ -200,9 +255,6 @@ views:
         title: 📈 Heizkurve
         show_header_toggle: false
         entities:
-          - entity: input_number.hp_heat_curve_at_high
-            name: AT Heizgrenze
-            mode: slider
           - entity: input_number.hp_heat_curve_vl_high
             name: VL bei AT Heizgrenze
             mode: slider
@@ -217,6 +269,11 @@ views:
             mode: slider
           - entity: input_number.hp_circuit1_offset
             name: Offset Kreis 1
+            mode: slider
+          - type: section
+            label: AT Witterungsführung (EMA)
+          - entity: input_number.hp_at_ema_tau_hours
+            name: EMA Zeitkonstante (τ)
             mode: slider
           - type: section
             label: Berechnete Sollwerte (aktuell)
@@ -240,14 +297,14 @@ views:
         entities:
           - type: section
             label: Heizung (Puffer-Hysterese)
-          - entity: input_number.hp_heating_threshold
+          - entity: input_number.hp_heat_curve_at_high
             name: Heizgrenze AT
             mode: slider
           - entity: input_number.hp_buffer_drain_margin
-            name: 'Puffer-Drain Abstand zum Sollwert'
+            name: Puffer-Drain Abstand zum Sollwert
             mode: slider
           - entity: input_number.hp_buffer_drain_hyst
-            name: 'Puffer-Drain Hysterese (Totband)'
+            name: Puffer-Drain Hysterese (Totband)
             mode: slider
           - type: section
             label: Warmwasser
@@ -292,7 +349,7 @@ views:
           - entity: input_number.hp_pv_buffer_max_kwh
             name: PV-Restmenge unter
             mode: slider
-          - entity: sensor.home_energy_production_today_remaining
+          - entity: sensor.energy_production_today_remaining
             name: PV-Restmenge (Prognose)
             icon: mdi:solar-power-variant
       - type: entities
@@ -311,11 +368,11 @@ views:
             name: Energiezustand (Register 40010)
             icon: mdi:lightning-bolt-circle
           - entity: input_number.hp_boost_pv_min_w
-            name: 'AN: PV mindestens'
+            name: "AN: PV mindestens"
             mode: slider
             icon: mdi:solar-power
           - entity: input_number.hp_boost_pv_off_w
-            name: 'AUS: PV unter'
+            name: "AUS: PV unter"
             mode: slider
             icon: mdi:solar-power-variant-outline
           - type: custom:template-entity-row
@@ -346,7 +403,4 @@ views:
             mode: slider
           - entity: input_number.hp_forced_lp_alpha
             name: Low-Pass Alpha (heating_forced)
-            mode: slider
-          - entity: input_number.hp_forced_setpoint_max_c
-            name: Sollwert-Obergrenze (heating_forced)
             mode: slider

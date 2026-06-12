@@ -439,7 +439,7 @@ lgthermav:
       name: "Solltemperatur Kreis 1"
       initial: 26
       min: 18
-      max: 65      # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
+      max: 65 # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
       step: 1
       unit_of_measurement: "°C"
       mode: slider
@@ -456,7 +456,7 @@ lgthermav:
       name: "Solltemperatur Kreis 2 "
       initial: 26
       min: 18
-      max: 65      # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
+      max: 65 # erhöht: FSM schreibt bis 60°C (buffer_charge_boost)
       step: 1
       unit_of_measurement: "°C"
       mode: slider
@@ -609,6 +609,7 @@ lgthermav:
             {{ modes.get(val, 'Unbekannt') }}
           icon: mdi:lightning-bolt-circle
 
+
     # ---------------
     # Binäre Sensoren
     # ---------------
@@ -660,7 +661,58 @@ lgthermav:
                   {% set mapping = {"Wasserauslass": 0, "Wassereinlass": 1, "Raumluft": 2} %}
                   {{ mapping[option] }}
 
-# Helpers
+    # Fallback-Sensoren: trigger-basiert, restore_state ist per default aktiv.
+    # Beim HA-Start wird der letzte Recorder-Wert wiederhergestellt; der Sensor
+    # aktualisiert sich nur wenn die Quelle einen gueltigen Wert liefert.
+    - trigger:
+        - trigger: state
+          entity_id: sensor.wp_arbeitszahl_15m
+          not_to:
+            - unavailable
+            - unknown
+      sensor:
+        - name: "WP Arbeitszahl 15m Fallback"
+          unique_id: wp_arbeitszahl_15m_fallback
+          unit_of_measurement: "W(th)/W(el)"
+          state: "{{ states('sensor.wp_arbeitszahl_15m') }}"
+
+    - trigger:
+        - trigger: state
+          entity_id: sensor.wp_arbeitszahl_1d
+          not_to:
+            - unavailable
+            - unknown
+      sensor:
+        - name: "WP Arbeitszahl 1d Fallback"
+          unique_id: wp_arbeitszahl_1d_fallback
+          unit_of_measurement: "W(th)/W(el)"
+          state: "{{ states('sensor.wp_arbeitszahl_1d') }}"
+
+    - trigger:
+        - trigger: state
+          entity_id: sensor.carnot_effizienz_15m
+          not_to:
+            - unavailable
+            - unknown
+      sensor:
+        - name: "Carnot Effizienz 15m Fallback"
+          unique_id: carnot_effizienz_15m_fallback
+          unit_of_measurement: "%"
+          state: "{{ states('sensor.carnot_effizienz_15m') }}"
+
+    - trigger:
+        - trigger: state
+          entity_id: sensor.carnot_effizienz_1d
+          not_to:
+            - unavailable
+            - unknown
+      sensor:
+        - name: "Carnot Effizienz 1d Fallback"
+          unique_id: carnot_effizienz_1d_fallback
+          unit_of_measurement: "%"
+          state: "{{ states('sensor.carnot_effizienz_1d') }}"
+
+  # Helpers
   counter:
     kompressor_takte:
       name: "WP-Kompressor Takte"
@@ -674,13 +726,19 @@ lgthermav:
       initial: 0
       step: 1
       icon: mdi:counter
+
+    mischventil_bewegungen:
+      name: "Mischventil Bewegungen"
+      initial: 0
+      step: 1
+      icon: mdi:counter
       restore: true
 
   input_button:
     kompressor_takte_reset:
       name: "WP-Kompressor Takte zurücksetzen"
       icon: mdi:restore
-    
+
     grundfos_takte_reset:
       name: "Grundfos Takte zurücksetzen"
       icon: mdi:restore
@@ -709,7 +767,7 @@ lgthermav:
           target:
             entity_id: counter.kompressor_takte
       mode: single
-    
+
     - alias: "Grundfos Start zählen"
       id: grundfos_start_counter
       trigger:
@@ -733,3 +791,61 @@ lgthermav:
           target:
             entity_id: counter.grundfos_takte
       mode: single
+
+    - alias: "Mischventil Bewegung zählen"
+      id: mischventil_bewegung_counter
+      trigger:
+        - platform: state
+          entity_id:
+            - switch.lg_thermav_circuit_2_1e6134_mischventil_auf
+            - switch.lg_thermav_circuit_2_1e6134_mischventil_zu
+          from: "off"
+          to: "on"
+      action:
+        - action: counter.increment
+          target:
+            entity_id: counter.mischventil_bewegungen
+      mode: single
+
+  sensor:
+    - platform: average
+      name: "WP-Arbeitszahl (15m)"
+      unique_id: avg_wp_arbeitszahl_15m
+      duration: 00:15:00
+      entities:
+        - sensor.wp_arbeitszahl
+
+    - platform: average
+      name: "WP-Arbeitszahl (1h)"
+      unique_id: avg_wp_arbeitszahl_1h
+      duration: 01:00:00
+      entities:
+        - sensor.wp_arbeitszahl
+
+    - platform: average
+      name: "WP-Arbeitszahl (1d)"
+      unique_id: avg_wp_arbeitszahl_1d
+      duration: 24:00:00
+      entities:
+        - sensor.wp_arbeitszahl
+
+    - platform: average
+      name: "Carnot-Effizienz (15m)"
+      unique_id: avg_carnot_effizienz_15m
+      duration: 00:15:00
+      entities:
+        - sensor.carnot_effizienz
+
+    - platform: average
+      name: "Carnot-Effizienz (1h)"
+      unique_id: avg_carnot_effizienz_1h
+      duration: 01:00:00
+      entities:
+        - sensor.carnot_effizienz
+
+    - platform: average
+      name: "Carnot-Effizienz (1d)"
+      unique_id: avg_carnot_effizienz_1d
+      duration: 01:00:00
+      entities:
+        - sensor.carnot_effizienz

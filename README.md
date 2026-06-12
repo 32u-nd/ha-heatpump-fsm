@@ -11,7 +11,7 @@ LG ThermaV Wärmepumpe über Modbus TCP in Home Assistant. Läuft als AppDaemon-
 
 ### Funktionsumfang
 
-- **Heizbetrieb** nach adaptiver Heizkurve mit PI-geregeltem 3-Wege-Mischer
+- **Heizbetrieb** nach adaptiver Heizkurve mit gedämpfter Witterungsführung (AT-EMA, τ einstellbar) und PI-geregeltem 3-Wege-Mischer
 - **Puffer-Entladung** — Haus heizen ohne Verdichter, solange Puffer warm genug
 - **PV-Überschussladung** — Pufferspeicher mit Photovoltaik-Überschuss laden (40002=1 Einlass-Regelung)
 - **Heizstab-Boost** — bei hohem PV-Überschuss Puffer auf 55 °C laden (inkl. Heizstab)
@@ -33,7 +33,7 @@ Alle Parameter sind zur Laufzeit über das HA-Dashboard (`input_number.hp_*`) an
 | PV-Sensoren | Momentanleistung (W) und Tagesrest (kWh) in HA |
 
 **Hydraulikkonzept — zwei Kreise:**
-- **Kreis 1** (Modbus 40003): WP-interner Regelkreis. Der FSM schreibt hier den Sollwert, um die WP am Laufen zu halten (`heating_forced`) oder die Puffer-Einlasstemperatur vorzugeben.
+- **Kreis 1** (Modbus 40003): WP-interner Regelkreis. In `heating` und `heating_forced` schreibt der FSM einen LP-gefilterten WP-Auslass-Wert + Offset, damit die WP-interne Hysterese (Verdichter stoppt wenn Auslass > Kreis1 + 4 °C) nicht vor Ablauf der Mindestlaufzeit greift. In `heating` gibt es zwei Phasen: Phase 1 (< 45 min) folgt dem Auslass bidirektional (Untergrenze: Heizkurve); Phase 2 (≥ 45 min) sinkt Kreis1 linear 1 °C/5 min zur Heizkurve zurück — WP stoppt intern von selbst. Wenn der Verdichter intern abschaltet, springt Kreis1 sofort auf `Heizkurve + circuit1_offset` (sauberer Start für nächsten Zyklus). In `buffer_drain`, `idle` und `standby` folgt Kreis1 normal der Heizkurve. In `buffer_charge` wird stattdessen die Einlass-Zieltemperatur gesetzt.
 - **Kreis 2** (Modbus 40006): Heizkreis mit Heizkörpern im Haus. Vorlauftemperatur wird durch den 3-Wege-Mischer (PI-Regler) geregelt; der FSM schreibt den Heizkurven-Sollwert.
 
 ---
@@ -79,24 +79,26 @@ Der 1/4-Fühler ist die Rücklaufzone (bleibt im Heizbetrieb kalt) und dient nur
 
 | Zustand | WP | Pumpe | Mischer | Energiezustand |
 |---|---|---|---|---|
-| `idle` | AUS | AUS | zu | 2 |
+| `idle` | AUS | AUS | **zu** | 2 |
 | `heating` | EIN | EIN | PI | 2 |
 | `heating_forced` | EIN | EIN | PI | 2 |
-| `hot_water` | EIN (WW) | AUS | zu | 2 |
+| `hot_water` | EIN (WW) | AUS | eingefroren | 2 |
 | `buffer_charge` | EIN (40002=1) | AT-abh. | AT-abh. | 3 |
 | `buffer_charge_boost` | EIN + Heizstab | AT-abh. | AT-abh. | 5 |
 | `buffer_drain` | AUS | EIN | PI | 2 |
-| `standby` | AUS | AUS | zu | 2 |
+| `standby` | AUS | AUS | eingefroren | 2 |
 
-**AT-abhängig** (buffer_charge/boost): bei AT < Heizgrenze läuft Pumpe + Mischer-PI
-(Haus wird parallel beheizt); bei AT ≥ Heizgrenze Pumpe AUS (Sommerbetrieb).
+Mischer: **eingefroren** = Position wird gespeichert, kein Fahrbefehl. Nur `idle` schließt aktiv. PI startet beim nächsten `heating`/`buffer_drain` von der gespeicherten Position.
+
+**AT-abhängig** (buffer_charge/boost): **EMA UND AT_1h < Heizgrenze** → Pumpe + Mischer-PI EIN (Haus parallel beheizt); **EMA ODER AT_1h ≥ Heizgrenze** → Pumpe AUS (Sommerbetrieb). Gleiche OR/AND-Logik wie bei heating/buffer_drain.
 
 ```
-AT kalt, Puffer warm:  idle → buffer_drain → heating → standby → ...
-AT kalt, Puffer kalt:  idle → heating → ...
-Puffer 1/2 voll:       heating → heating_forced / standby
-WW-Fenster:            (beliebig) → hot_water → standby
-PV-Überschuss:         idle/standby/buffer_drain → buffer_charge → [boost] → standby
+AT kalt, Puffer warm:   idle → buffer_drain → heating → buffer_drain → ...
+AT kalt, Puffer kalt:   idle → heating → ...
+Komp. intern gestoppt:  heating → buffer_drain (Puffer warm) → heating (Puffer kalt)
+Puffer 1/2 voll:        heating → heating_forced / standby
+WW-Fenster:             (beliebig) → hot_water → standby
+PV-Überschuss:          idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
 
 #### buffer_drain / heating Schwellen (dynamisch)
@@ -117,12 +119,14 @@ Hysterese zwischen EIN und AUS verhindert Takt an der Grenze.
 
 ```
 slope    = (vl_low − vl_high) / (at_high − at_low)
-base     = vl_high + (at_high − AT_1h) × slope
+base     = vl_high + (at_high − AT_EMA) × slope
 VL_roh   = clamp(base − pv_correction_per_kw × pv_kw_15min, 18, 60) °C
 VL_Soll  = EWMA(VL_roh, α = setpoint_ewma_alpha)          ← Sollwert-Glättung
 ```
 
-- AT: 1h-Mittelwert (`sensor.aussentemperatur_mittelwert_1h`).
+- AT (`sensor.aussentemperatur_ema`): exponentiell geglättet, τ = `hp_at_ema_tau_hours` (Default 24 h, einstellbar 1–72 h). Dämpft Takt an der Heizgrenze; bei schwerem Bau τ ≈ 12–24 h empfohlen.
+- AT **Exit** (Heizung/buffer_drain AUS): **EMA ODER AT_1h ≥ Heizgrenze** → Heizung stoppt. Sobald einer der beiden Sensoren warm meldet, ist kein Heizbedarf mehr.
+- AT **Entry** (Heizung/buffer_drain EIN): **EMA UND AT_1h < Heizgrenze** (beide müssen kalt sein). Verhindert Einschalten wenn sich die Sensoren widersprechen (z. B. EMA noch kalt, 1h schon warm → Tendenz steigend).
 - PV: bereits ein 15-min-Mittelwert — kein zusätzliches EWMA auf PV nötig.
 - **Sollwert-EWMA** (α = 0,1, Zeitkonstante ≈ 45 s): der fertige Sollwert wird gedämpft bevor er in PI-Regler und 40006 geht. Schwellen-Berechnungen nutzen den Roh-Sollwert (keine Glättungsverzögerung bei Zustandswechseln).
 
@@ -148,6 +152,10 @@ Eine **Mindestlaufzeit** (`buffer_charge_min_minutes`, Default 5 min) schützt v
 Sommerbetrieb: Die WP-interne Pumpe liest beim Start sofort heißes Rohrrestwasser aus dem
 vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fälschlicherweise feuern.
 
+#### Kreis 1 in buffer_drain / standby / idle
+
+In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Heizkurven-Sollwert und werden bei AT-, PV- und Parameter-Änderungen nachgeführt. Die WP ist aus; die Register bleiben aktuell für einen sauberen Neustart.
+
 ---
 
 ### Wichtigste Parameter
@@ -155,17 +163,17 @@ vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fä
 #### Heizkurve
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `hp_heat_curve_at_high` | 16 °C | Oberer AT-Stützpunkt (Heizgrenze) |
+| `hp_heat_curve_at_high` | 16 °C | Heizgrenze **und** oberer AT-Stützpunkt (ein Parameter für beide Rollen) |
 | `hp_heat_curve_vl_high` | 27 °C | VL-Soll bei AT hoch |
 | `hp_heat_curve_at_low` | −15 °C | Unterer AT-Stützpunkt (Auslegungspunkt) |
 | `hp_heat_curve_vl_low` | 40 °C | VL-Soll bei AT niedrig |
 | `hp_pv_correction_per_kw` | 0,2 °C/kW | VL-Absenkung pro kW PV |
 | `hp_circuit1_offset` | 1 °C | Kreis-1-Aufschlag über Kreis 2 (WP läuft etwas wärmer als Heizkörper-VL) |
+| `hp_at_ema_tau_hours` | 24 h | Zeitkonstante τ der AT-EMA (1–72 h) |
 
 #### Puffer & Schwellen
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `hp_heating_threshold` | 16 °C | AT-Heizgrenze |
 | `hp_buffer_drain_margin` | 3 °C | Abstand der EIN-Schwelle über Heizkurve |
 | `hp_buffer_drain_hyst` | 2 °C | Totband EIN/AUS |
 
@@ -181,8 +189,10 @@ vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fä
 #### Verdichterschutz
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `hp_min_runtime_minutes` | 45 min | Mindestlaufzeit |
-| `hp_forced_setpoint_max_c` | 50 °C | Kreis-1-Obergrenze in heating_forced |
+| `hp_min_runtime_minutes` | 45 min | Mindestlaufzeit Verdichter |
+| `hp_standby_minutes` | 3 min | Schutzpause zwischen Zyklen |
+| `hp_forced_setpoint_offset` | 1 °C | Kreis-1-Offset über LP-Wert (in `heating` und `heating_forced`) |
+| `hp_forced_lp_alpha` | 0,2 | LP-Filter-Alpha WP-Auslass (in `heating` und `heating_forced`) |
 | `hp_cycling_window_minutes` | 60 min | Takt-Schutz: Beobachtungsfenster |
 | `hp_cycling_max_starts` | 6 | Takt-Schutz: Max-Starts → Dry-Run |
 
@@ -195,11 +205,14 @@ vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fä
 | **E-Stop** | > 10 FSM-Wechsel in 5 s → Dry-Run + HA-Benachrichtigung |
 | **Takt-Schutz** | ≥ 6 Verdichter-Starts / 60 min → Dry-Run + Benachrichtigung |
 | **Dry-Run** | FSM aktiv, kein Modbus-/Cover-Write; Hardware-Sync beim Deaktivieren |
-| **AT-Fallback** | Letzter gültiger AT gecacht; Startup-Default 30 °C (kein Heizbedarf) |
+| **AT-Fallback** | Letzter gültiger AT gecacht (EMA und 1h-Sensor getrennt); Startup-Default 30 °C (kein Heizbedarf) |
 | **VL-Fallback** | Letzter gültiger Vorlaufwert gecacht; PI pausiert bei fehlendem Cache |
-| **Einlass-Guard** | Einlass-Temp → 0 wenn Umwälzpumpe aus (kein falscher buffer_charge-Exit) |
+| **Einlass-Guard** | `_wp_inlet_temp()` → 0 wenn WP-Pumpe aus (verhindert Fehlausstieg durch veralteten Sensorwert). Ladeentscheidung + Hysterese nutzen `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: Flag `_buffer_fully_charged` über `_buffer_bottom()` (Puffer 1/4) — Einlass kühlt via Rohrverluste ab wenn Pumpe stoppt |
 | **Mindestlaufzeit buffer_charge** | Ausstieg per Temperatur erst nach 5 min; verhindert Fehlausstieg durch Rohrrestwasser (Sommerbetrieb) |
+| **Puffer-Hysterese-Restore** | `_buffer_fully_charged` wird in `initialize()` aus Puffer 1/4-Sensor wiederhergestellt — verhindert Sofort-Re-Ladezyklus nach AppDaemon-Neustart |
 | **Neustart-Restore** | FSM-Zustand aus `input_select` nach AppDaemon-Neustart wiederhergestellt |
+| **AT EMA Persistenz** | EMA-Wert überlebt HA-Neustarts. `hp_at_ema_value` hat kein `initial:` — HA überschreibt bei gesetztem `initial:` immer den gespeicherten Zustand. Template-Sensor gibt `none` bei unbekanntem Zustand (AT-Fallback greift). Automation: `time_pattern /5min`; Sentinel `ema_prev ≥ 90` initialisiert beim Erst-Deploy |
+| **Mischer Position-Erhalt** | `standby` und `hot_water` frieren Mischerposition ein (kein Fahrbefehl, Position in `_last_pi_position` gesichert). `idle` schließt als einziger Zustand aktiv. PI startet beim nächsten `heating`/`buffer_drain` von gespeicherter Position |
 
 ---
 
@@ -264,7 +277,7 @@ heat pump via Modbus TCP in Home Assistant. Runs as an AppDaemon app (Docker).
 
 ### Features
 
-- **Heating mode** following an adaptive heating curve with PI-controlled 3-way mixer
+- **Heating mode** following an adaptive heating curve with smoothed weather compensation (OAT EMA, configurable time constant) and PI-controlled 3-way mixer
 - **Buffer drain** — heat the house without the compressor while the buffer is warm enough
 - **PV surplus charging** — charge buffer storage with photovoltaic surplus (Modbus 40002=1 inlet control)
 - **Heating element boost** — charge buffer to 55 °C with high PV surplus (including heating rod)
@@ -286,7 +299,7 @@ All parameters are adjustable at runtime via the HA dashboard (`input_number.hp_
 | PV sensors | Instantaneous power (W) and daily remaining energy (kWh) in HA |
 
 **Hydraulic concept — two circuits:**
-- **Circuit 1** (Modbus 40003): internal heat pump control loop. The FSM writes a setpoint here to keep the compressor running (`heating_forced`) or to set the buffer inlet target.
+- **Circuit 1** (Modbus 40003): internal heat pump control loop. In `heating` and `heating_forced` the FSM writes an LP-filtered outlet value + offset, preventing the HP's internal hysteresis (compressor stops when outlet > Circuit 1 + 4 °C) from triggering before the minimum runtime elapses. In `heating` there are two phases: Phase 1 (< 45 min) tracks the outlet bidirectionally (floor: heating curve); Phase 2 (≥ 45 min) Circuit 1 ramps down linearly at 1 °C/5 min toward the heating curve — the compressor stops naturally. When the compressor stops internally, Circuit 1 jumps immediately to `heating curve + circuit1_offset` for a clean start of the next cycle. In `buffer_drain`, `idle`, and `standby` Circuit 1 follows the heating curve normally. In `buffer_charge` the inlet target temperature is written instead.
 - **Circuit 2** (Modbus 40006): house heating circuit with radiators. Supply temperature is regulated by the 3-way mixer (PI controller); the FSM writes the heating curve setpoint.
 
 ---
@@ -332,24 +345,26 @@ The 1/4 sensor is the return zone (stays cold during heating) and only serves as
 
 | State | HP | Pump | Mixer | Energy state |
 |---|---|---|---|---|
-| `idle` | OFF | OFF | closed | 2 |
+| `idle` | OFF | OFF | **closed** | 2 |
 | `heating` | ON | ON | PI | 2 |
 | `heating_forced` | ON | ON | PI | 2 |
-| `hot_water` | ON (DHW) | OFF | closed | 2 |
+| `hot_water` | ON (DHW) | OFF | frozen | 2 |
 | `buffer_charge` | ON (40002=1) | OAT-dep. | OAT-dep. | 3 |
 | `buffer_charge_boost` | ON + rod | OAT-dep. | OAT-dep. | 5 |
 | `buffer_drain` | OFF | ON | PI | 2 |
-| `standby` | OFF | OFF | closed | 2 |
+| `standby` | OFF | OFF | frozen | 2 |
 
-**OAT-dependent** (buffer_charge/boost): if OAT < heating threshold, pump + mixer PI run
-(house heated in parallel); if OAT ≥ threshold, pump OFF (summer mode).
+Mixer: **frozen** = position saved, no travel command. Only `idle` actively closes. PI resumes from the saved position on the next `heating`/`buffer_drain`.
+
+**OAT-dependent** (buffer_charge/boost): **EMA AND OAT_1h < threshold** → pump + mixer PI ON (house heated in parallel); **EMA OR OAT_1h ≥ threshold** → pump OFF (summer mode). Same OR/AND logic as heating/buffer_drain.
 
 ```
-OAT cold, buffer warm:  idle → buffer_drain → heating → standby → ...
-OAT cold, buffer cold:  idle → heating → ...
-Buffer 1/2 full:        heating → heating_forced / standby
-DHW window:             (any state) → hot_water → standby
-PV surplus:             idle/standby/buffer_drain → buffer_charge → [boost] → standby
+OAT cold, buffer warm:      idle → buffer_drain → heating → buffer_drain → ...
+OAT cold, buffer cold:      idle → heating → ...
+Compressor stops internally: heating → buffer_drain (buffer warm) → heating (buffer cold)
+Buffer 1/2 full:            heating → heating_forced / standby
+DHW window:                 (any state) → hot_water → standby
+PV surplus:                 idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
 
 #### buffer_drain / heating thresholds (dynamic)
@@ -370,12 +385,14 @@ Hysteresis between ON and OFF prevents cycling at the boundary.
 
 ```
 slope    = (vl_low − vl_high) / (at_high − at_low)
-base     = vl_high + (at_high − OAT_1h) × slope
+base     = vl_high + (at_high − OAT_EMA) × slope
 SP_raw   = clamp(base − pv_correction_per_kw × pv_kw_15min, 18, 60) °C
 SP_flow  = EWMA(SP_raw, α = setpoint_ewma_alpha)           ← setpoint smoothing
 ```
 
-- OAT: 1h mean (`sensor.aussentemperatur_mittelwert_1h`).
+- OAT **entry** (heating/buffer_drain ON): `sensor.aussentemperatur_ema` — exponentially smoothed, τ = `hp_at_ema_tau_hours` (default 24 h, adjustable 1–72 h). Prevents cycling at the heating threshold; for heavy construction τ ≈ 12–24 h recommended.
+- OAT **exit** (heating/buffer_drain OFF): **EMA OR OAT_1h ≥ threshold** — heating stops as soon as either sensor reads warm.
+- OAT **entry** (heating/buffer_drain ON): **EMA AND OAT_1h < threshold** — both sensors must agree it is cold. Prevents switching on when sensors disagree (e.g. EMA still cold, 1 h already warm → temperature is rising).
 - PV: already a 15-min average — no additional EWMA on PV needed.
 - **Setpoint EWMA** (α = 0.1, time constant ≈ 45 s): final setpoint is smoothed before being sent to PI controller and register 40006. Threshold calculations use the raw setpoint (no lag for state transitions).
 
@@ -397,6 +414,10 @@ With `40002=1` (inlet control), the HP regulates to the **inlet** temperature
 (return from buffer bottom). Inlet ≥ target ⇒ entire buffer ≥ target (stratification).
 Natural "buffer full" condition — no cycling from premature outlet detection.
 
+#### Circuit 1 in buffer_drain / standby / idle
+
+In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating curve setpoint, updated on OAT, PV, and parameter changes. The HP is off; registers stay current for a clean restart.
+
 ---
 
 ### Key Parameters
@@ -404,17 +425,17 @@ Natural "buffer full" condition — no cycling from premature outlet detection.
 #### Heating curve
 | Parameter | Default | Description |
 |---|---|---|
-| `hp_heat_curve_at_high` | 16 °C | Upper OAT setpoint (heating limit) |
+| `hp_heat_curve_at_high` | 16 °C | Heating limit **and** upper OAT setpoint (one parameter for both roles) |
 | `hp_heat_curve_vl_high` | 27 °C | Supply setpoint at high OAT |
 | `hp_heat_curve_at_low` | −15 °C | Lower OAT setpoint (design point) |
 | `hp_heat_curve_vl_low` | 40 °C | Supply setpoint at low OAT |
 | `hp_pv_correction_per_kw` | 0.2 °C/kW | Supply setpoint reduction per kW PV |
 | `hp_circuit1_offset` | 1 °C | Circuit 1 offset above circuit 2 (HP runs slightly warmer than radiator supply) |
+| `hp_at_ema_tau_hours` | 24 h | OAT EMA time constant τ (1–72 h) |
 
 #### Buffer & thresholds
 | Parameter | Default | Description |
 |---|---|---|
-| `hp_heating_threshold` | 16 °C | OAT heating limit |
 | `hp_buffer_drain_margin` | 3 °C | ON-threshold margin above heating curve |
 | `hp_buffer_drain_hyst` | 2 °C | Dead band between ON and OFF |
 
@@ -430,8 +451,10 @@ Natural "buffer full" condition — no cycling from premature outlet detection.
 #### Compressor protection
 | Parameter | Default | Description |
 |---|---|---|
-| `hp_min_runtime_minutes` | 45 min | Minimum runtime |
-| `hp_forced_setpoint_max_c` | 50 °C | Circuit 1 upper limit in heating_forced |
+| `hp_min_runtime_minutes` | 45 min | Minimum compressor runtime |
+| `hp_standby_minutes` | 3 min | Protective pause between cycles |
+| `hp_forced_setpoint_offset` | 1 °C | Circuit 1 offset above LP value (used in both `heating` and `heating_forced`) |
+| `hp_forced_lp_alpha` | 0.2 | LP filter alpha for WP outlet (used in both `heating` and `heating_forced`) |
 | `hp_cycling_window_minutes` | 60 min | Cycling protection: observation window |
 | `hp_cycling_max_starts` | 6 | Cycling protection: max starts → dry-run |
 
@@ -444,10 +467,13 @@ Natural "buffer full" condition — no cycling from premature outlet detection.
 | **E-Stop** | > 10 FSM transitions in 5 s → dry-run + HA notification |
 | **Cycling protection** | ≥ 6 compressor starts / 60 min → dry-run + notification |
 | **Dry-run** | FSM fully active, no Modbus/cover write; hardware sync on deactivation |
-| **OAT fallback** | Last valid OAT cached; startup default 30 °C (no heating demand) |
+| **OAT fallback** | Last valid OAT cached for both EMA and 1h sensors; startup default 30 °C (no heating demand) |
 | **Flow temp fallback** | Last valid flow temp cached; PI pauses if no cache (startup) |
-| **Inlet guard** | Inlet temp → 0 when circulation pump off (prevents false buffer_charge exit) |
+| **Inlet guard** | `_wp_inlet_temp()` → 0 when WP pump off (prevents false exit from stale sensor). Charge decision + hysteresis use `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: `_buffer_fully_charged` set via `_buffer_bottom()` (buffer 1/4) — inlet cools via pipe losses when pump stops |
+| **Buffer hysteresis restore** | `_buffer_fully_charged` restored in `initialize()` from buffer 1/4 sensor — prevents immediate re-charge cycle after AppDaemon restart |
 | **Restart restore** | FSM state restored from `input_select` after AppDaemon restart |
+| **OAT EMA persistence** | EMA survives HA restarts. `hp_at_ema_value` has no `initial:` — HA always overrides restored state when `initial:` is set in YAML. Template sensor returns `none` when unknown (OAT fallback 30 °C applies). Automation: `time_pattern /5min`; sentinel `ema_prev ≥ 90` initialises on first deploy |
+| **Mixer position retention** | `standby` and `hot_water` freeze the mixer position (no travel command, position saved in `_last_pi_position`). `idle` is the only state that actively closes the mixer. PI resumes from the saved position on next `heating`/`buffer_drain` |
 
 ---
 
