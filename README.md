@@ -205,12 +205,15 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | **E-Stop** | > 10 FSM-Wechsel in 5 s → Dry-Run + HA-Benachrichtigung |
 | **Takt-Schutz** | ≥ 6 Verdichter-Starts / 60 min → Dry-Run + Benachrichtigung |
 | **Dry-Run** | FSM aktiv, kein Modbus-/Cover-Write; Hardware-Sync beim Deaktivieren |
-| **AT-Fallback** | Letzter gültiger AT gecacht (EMA und 1h-Sensor getrennt); Startup-Default 30 °C (kein Heizbedarf) |
+| **AT-Fallback (asymmetrisch)** | Einschalt-Checks: Startup-Default 30 °C (kein Heizbedarf), letzter gültiger AT gecacht (EMA und 1h-Sensor getrennt). Abschalt-Checks (`_at_above_threshold()`): `None` statt Default bei unavailable → die WP wird **nie** auf einem Default-Wert abgeschaltet |
 | **VL-Fallback** | Letzter gültiger Vorlaufwert gecacht; PI pausiert bei fehlendem Cache |
 | **Einlass-Guard** | `_wp_inlet_temp()` → 0 wenn WP-Pumpe aus (verhindert Fehlausstieg durch veralteten Sensorwert). Ladeentscheidung + Hysterese nutzen `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: Flag `_buffer_fully_charged` über `_buffer_bottom()` (Puffer 1/4) — Einlass kühlt via Rohrverluste ab wenn Pumpe stoppt |
 | **Mindestlaufzeit buffer_charge** | Ausstieg per Temperatur erst nach 5 min; verhindert Fehlausstieg durch Rohrrestwasser (Sommerbetrieb) |
 | **Puffer-Hysterese-Restore** | `_buffer_fully_charged` wird in `initialize()` aus Puffer 1/4-Sensor wiederhergestellt — verhindert Sofort-Re-Ladezyklus nach AppDaemon-Neustart |
 | **Neustart-Restore** | FSM-Zustand aus `input_select` nach AppDaemon-Neustart wiederhergestellt |
+| **Backup-/Startup-Grace** | Stoppt ein tägliches Backup alle Container, sind Sensoren beim AppDaemon-Neustart kurz `unavailable`. `_in_startup_grace()` unterdrückt alle WP-Abschalt-Transitionen (`heating→standby`, `heating_forced→standby`, `buffer_drain→idle`) für `startup_grace_seconds` (180 s); `initial_enter_delay_s` 5 → 30 s gibt Sensoren Zeit vor der ersten Transition |
+| **Kompressor-Restore** | `_compressor_on_since` ist In-Memory; `listen_state` feuert nicht für den bestehenden Zustand. `initialize()` liest `binary_sensor.kompressor_20004`: bei `on` → `now()` (frische Mindestlaufzeit), damit ein durchlaufender Verdichter nach Neustart nicht als „intern gestoppt" gilt und `heating→buffer_drain` die WP fälschlich stoppt |
+| **Puffer-Gültigkeit** | `_buffer_mid`/`_buffer_bottom` cachen letzten echten Wert. `_buffer_mid_valid()` ist `False` bis nach Neustart der erste Wert eintrifft → `_need_heating`/`_need_buffer_drain` entscheiden nicht auf dem 40 °C-Default, sondern halten den Zustand |
 | **AT EMA Persistenz** | EMA-Wert überlebt HA-Neustarts. `hp_at_ema_value` hat kein `initial:` — HA überschreibt bei gesetztem `initial:` immer den gespeicherten Zustand. Template-Sensor gibt `none` bei unbekanntem Zustand (AT-Fallback greift). Automation: `time_pattern /5min`; Sentinel `ema_prev ≥ 90` initialisiert beim Erst-Deploy |
 | **Mischer Position-Erhalt** | `standby` und `hot_water` frieren Mischerposition ein (kein Fahrbefehl, Position in `_last_pi_position` gesichert). `idle` schließt als einziger Zustand aktiv. PI startet beim nächsten `heating`/`buffer_drain` von gespeicherter Position |
 
@@ -467,11 +470,14 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | **E-Stop** | > 10 FSM transitions in 5 s → dry-run + HA notification |
 | **Cycling protection** | ≥ 6 compressor starts / 60 min → dry-run + notification |
 | **Dry-run** | FSM fully active, no Modbus/cover write; hardware sync on deactivation |
-| **OAT fallback** | Last valid OAT cached for both EMA and 1h sensors; startup default 30 °C (no heating demand) |
+| **OAT fallback (asymmetric)** | Turn-on checks: startup default 30 °C (no heating demand), last valid OAT cached for both EMA and 1h sensors. Turn-off checks (`_at_above_threshold()`): `None` instead of a default when unavailable → the heat pump is **never** switched off on a default value |
 | **Flow temp fallback** | Last valid flow temp cached; PI pauses if no cache (startup) |
 | **Inlet guard** | `_wp_inlet_temp()` → 0 when WP pump off (prevents false exit from stale sensor). Charge decision + hysteresis use `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: `_buffer_fully_charged` set via `_buffer_bottom()` (buffer 1/4) — inlet cools via pipe losses when pump stops |
 | **Buffer hysteresis restore** | `_buffer_fully_charged` restored in `initialize()` from buffer 1/4 sensor — prevents immediate re-charge cycle after AppDaemon restart |
 | **Restart restore** | FSM state restored from `input_select` after AppDaemon restart |
+| **Backup / startup grace** | When a daily backup stops all containers, sensors are briefly `unavailable` after the AppDaemon restart. `_in_startup_grace()` suppresses all heat-pump-off transitions (`heating→standby`, `heating_forced→standby`, `buffer_drain→idle`) for `startup_grace_seconds` (180 s); `initial_enter_delay_s` raised 5 → 30 s gives sensors time before the first transition |
+| **Compressor restore** | `_compressor_on_since` is in-memory; `listen_state` does not fire for the pre-existing state. `initialize()` reads `binary_sensor.kompressor_20004`: if `on` → `now()` (fresh minimum runtime), so a compressor running through the restart is not treated as "internally stopped" and `heating→buffer_drain` cannot wrongly stop the heat pump |
+| **Buffer validity** | `_buffer_mid`/`_buffer_bottom` cache the last real value. `_buffer_mid_valid()` is `False` until the first reading arrives after restart → `_need_heating`/`_need_buffer_drain` do not decide on the 40 °C default but hold the current state |
 | **OAT EMA persistence** | EMA survives HA restarts. `hp_at_ema_value` has no `initial:` — HA always overrides restored state when `initial:` is set in YAML. Template sensor returns `none` when unknown (OAT fallback 30 °C applies). Automation: `time_pattern /5min`; sentinel `ema_prev ≥ 90` initialises on first deploy |
 | **Mixer position retention** | `standby` and `hot_water` freeze the mixer position (no travel command, position saved in `_last_pi_position`). `idle` is the only state that actively closes the mixer. PI resumes from the saved position on next `heating`/`buffer_drain` |
 

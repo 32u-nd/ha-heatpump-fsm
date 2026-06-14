@@ -64,6 +64,14 @@ heatpump_fsm:
   estop_max_transitions:  10
   estop_window_seconds:   5
 
+  # ── Neustart-Schutz (Backup ~02:05) ─────────────────────────
+  # Nach (Neu-)Start: HA-Services-Delay vor erster Transition-Pruefung,
+  # damit Sensoren Zeit zum Hochkommen haben (ESPHome reconnect, Recorder).
+  initial_enter_delay_s:  30
+  # Zeitfenster nach Start, in dem KEINE WP-Abschaltung erfolgt
+  # (heating->standby, heating_forced->standby, buffer_drain->idle).
+  startup_grace_seconds:  180
+
   # ── HA-Integration ──────────────────────────────────────────
   input_select_entity:    input_select.heatpump_state
   fire_events:            true

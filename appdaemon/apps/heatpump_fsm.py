@@ -353,12 +353,26 @@ class HeatpumpFSM(FSMBase):
         self._outdoor_temp_cache: float | None = None  # letzter gueltiger AT-EMA-Wert
         self._outdoor_temp_1h_cache: float | None = None  # letzter gueltiger AT-1h-Wert
         self._flow_temp_cache: float | None = None  # letzter gueltiger VL-Wert
+        self._buffer_mid_cache: float | None = None  # letzter gueltiger Puffer-1/2-Wert
+        self._buffer_bottom_cache: float | None = None  # letzter gueltiger Puffer-1/4-Wert
         self._compressor_starts: collections.deque = collections.deque()  # Takt-Schutz
         self._last_wp_mode_log: str | None = None  # Deduplizierung: letzter Modbus-Log
         self._last_pi_position: float | None = None  # letzte PI-Gleichgewichtsposition vor Schliessen
         self._mixer_was_closed: bool = False  # _mixer_full_close() wurde aufgerufen; Cover evtl. noch in Bewegung
 
+        # Startup-Grace: direkt nach (Neu-)Start keine WP-Abschalt-Entscheidung.
+        # Schuetzt gegen Fehl-Abschaltung beim taeglichen Backup (~02:05), wenn
+        # ESPHome-/Statistics-Sensoren nach Container-Neustart noch nicht frisch sind.
+        self._startup_time = datetime.datetime.now()
+        self._startup_grace_s = float(self.args.get("startup_grace_seconds", 180))
+
         super().initialize()
+
+        if self._startup_grace_s > 0:
+            self.log(
+                f"[HP] Startup-Grace aktiv: keine WP-Abschaltung fuer {self._startup_grace_s:.0f}s",
+                level="INFO",
+            )
 
         # Energiezustand beim Start auf Normal setzen
         self._set_energy_state(2)
@@ -373,6 +387,23 @@ class HeatpumpFSM(FSMBase):
                 f">= {restart_temp:.1f}C",
                 level="INFO",
             )
+
+        # Kompressor-Zustand nach Neustart rekonstruieren:
+        # listen_state feuert NICHT fuer den schon bestehenden Zustand. Lief der
+        # Kompressor durch das Backup hindurch, bliebe _compressor_on_since None und
+        # 'heating -> buffer_drain' (Guard: _compressor_on_since is None) wuerde die
+        # laufende WP faelschlich stoppen. Konservativ now() setzen -> frische
+        # Mindestlaufzeit, WP laeuft weiter bis zum echten Kompressor-AUS-Signal.
+        try:
+            if self.get_state(self._binary_compressor) == "on":
+                self._compressor_on_since = datetime.datetime.now()
+                self.log(
+                    "[HP] Kompressor laeuft bei Start - _compressor_on_since "
+                    "rekonstruiert (frische Mindestlaufzeit)",
+                    level="INFO",
+                )
+        except Exception as e:
+            self.log(f"[HP] Kompressor-Restore fehlgeschlagen: {e}", level="WARNING")
 
         # WW-Fenster nach Neustart wiederherstellen falls gerade aktiv
         self._restore_hw_window_if_active()
@@ -1371,13 +1402,38 @@ class HeatpumpFSM(FSMBase):
     # Bedingungsfunktionen
     # -------------------------------------------------------------------------
 
+    def _in_startup_grace(self) -> bool:
+        """True fuer startup_grace_seconds nach (Neu-)Start. In diesem Fenster wird
+        keine WP-Abschalt-Transition ausgefuehrt - Schutz waehrend Backup-Neustart (~02:05)."""
+        if self._startup_grace_s <= 0:
+            return False
+        return (
+            datetime.datetime.now() - self._startup_time
+        ).total_seconds() < self._startup_grace_s
+
     def _at_above_threshold(self) -> bool:
         """Exit-Bedingung: kein Heizbedarf wenn EMA *oder* AT_1h ueber Heizgrenze.
-        Pendant zu _need_heating(): dort EMA UND 1h unter Grenze (Entry); hier EMA ODER 1h drueber (Exit)."""
-        return (
-            self._outdoor_temp() >= self._heating_threshold
-            or self._outdoor_temp_1h() >= self._heating_threshold
+        Pendant zu _need_heating(): dort EMA UND 1h unter Grenze (Entry); hier EMA ODER 1h drueber (Exit).
+
+        Eine WP-Abschaltung wird NIE auf Default-/Ratewerten getroffen:
+        - Waehrend Startup-Grace -> False (nicht abschalten).
+        - Wenn ein AT-Sensor unavailable ist und kein gueltiger Cache existiert
+          (-> _sensor_value_or_none() liefert None) -> False (AT unbekannt, nicht abschalten).
+        Verhindert Fehl-Abschaltung nach Container-Neustart, wenn der 1h-Statistics-Sensor
+        noch unavailable ist und sonst auf 30C ('warm') defaulten wuerde.
+        """
+        if self._in_startup_grace():
+            return False
+        ema = self._sensor_value_or_none(
+            self._sensor_outdoor_temp, "_outdoor_temp_cache"
         )
+        h1 = self._sensor_value_or_none(
+            self._sensor_outdoor_temp_1h, "_outdoor_temp_1h_cache"
+        )
+        if ema is None or h1 is None:
+            return False
+        thr = self._heating_threshold
+        return ema >= thr or h1 >= thr
 
     def _need_heating(self) -> bool:
         # buffer_mid (1/2) als Schaltpunkt: zeigt ob genuegend Waerme fuer Drain/Haus vorhanden.
@@ -1385,6 +1441,8 @@ class HeatpumpFSM(FSMBase):
         # Aus idle/standby/drain: on-Schwelle triggert WP-Start.
         # Entry-Bedingung prueft BEIDE AT-Sensoren: EMA (traege, Entry-Schutz) UND 1h (schnell).
         # Verhindert standby->heating->standby-Bounce wenn AT_1h bereits warm aber EMA noch kalt.
+        if not self._buffer_mid_valid():
+            return False  # Puffer 1/2 noch unbekannt (Neustart) -> Zustand halten
         threshold = (
             self._buffer_drain_threshold_off()
             if self.state == "heating"
@@ -1407,6 +1465,8 @@ class HeatpumpFSM(FSMBase):
         Heizzyklen ist der Pufferboden oft kalt (Ruecklauf), waehrend die oberen Zonen
         noch ausreichend Waerme fuer den Heizkreis haben.
         """
+        if not self._buffer_mid_valid():
+            return False  # Puffer 1/2 noch unbekannt (Neustart) -> Zustand halten
         return (
             self._outdoor_temp() < self._heating_threshold
             and self._outdoor_temp_1h() < self._heating_threshold
@@ -1696,7 +1756,7 @@ class HeatpumpFSM(FSMBase):
 
         Phase 1 (<min_runtime): LP folgt WP-Auslass bidirektional; Untergrenze
         Kreis1 = Heizkurven-Sollwert (Kreis2), damit Kreis1 nie darunter faellt.
-        Phase 2 (>=min_runtime): Kreis1 faellt linear 1 C/5 min zurueck auf den
+        Phase 2 (>=min_runtime): Kreis1 faellt linear 1 C/10 min zurueck auf den
         Heizkurven-Sollwert -> WP stoppt intern (Auslass > Kreis1 + 4 C).
         Obergrenze in beiden Phasen: heat_curve_vl_low.
         Kreis 2 (40006) bleibt der Heizkurven-Sollwert.
@@ -1716,14 +1776,14 @@ class HeatpumpFSM(FSMBase):
             self._forced_lp_value = max(raw, lp_floor)
             self._decay_start_time = None
         elif min_elapsed:
-            # Phase 2: linearer Rueckgang 1 C / 5 min bis Heizkurven-Sollwert
+            # Phase 2: linearer Rueckgang 1 C / 10 min bis Heizkurven-Sollwert
             if self._decay_start_time is None:
                 self._decay_start_time = datetime.datetime.now()
                 self._decay_lp_start = self._forced_lp_value
             elapsed_min = (
                 datetime.datetime.now() - self._decay_start_time
             ).total_seconds() / 60.0
-            lp_decayed = self._decay_lp_start - elapsed_min / 5.0
+            lp_decayed = self._decay_lp_start - elapsed_min / 10.0
             self._forced_lp_value = max(lp_floor, lp_decayed)
         else:
             # Phase 1: bidirektionaler LP-Filter; Untergrenze = Heizkurve
@@ -2187,36 +2247,39 @@ class HeatpumpFSM(FSMBase):
     # Sensor-Lesehilfen
     # -------------------------------------------------------------------------
 
+    def _sensor_value_or_none(self, entity: str, cache_attr: str) -> float | None:
+        """Sensor als float oder None. Gueltiger Wert wird in cache_attr gecached.
+        Bei unavailable: letzter gueltiger Cache, sonst None (KEIN Default).
+        None bedeutet fuer Schaltentscheidungen 'Wert unbekannt -> nicht entscheiden'.
+        Der Cache haelt den letzten ECHTEN Messwert: ein kurzer Sensor-Aussetzer im
+        Normalbetrieb liefert weiter gueltige Werte; nur direkt nach (Neu-)Start,
+        solange noch nie ein Wert kam, ist das Ergebnis None."""
+        raw = self.get_state(entity)
+        try:
+            val = float(raw)
+            setattr(self, cache_attr, val)
+            return val
+        except (TypeError, ValueError):
+            return getattr(self, cache_attr)
+
     def _outdoor_temp(self) -> float:
         """Letzten gueltigen AT-Wert cachen. Bei Sensorausfall wird der Cache gehalten
         statt auf 30°C zu springen, was den Sollwert schlagartig auf 18°C fallen lassen wuerde.
-        Startup-Default 30°C (sicher warm) bis erster gueltiger Wert empfangen wird."""
-        raw = self.get_state(self._sensor_outdoor_temp)
-        try:
-            val = float(raw)
-            self._outdoor_temp_cache = val
-            return val
-        except (TypeError, ValueError):
-            return (
-                self._outdoor_temp_cache
-                if self._outdoor_temp_cache is not None
-                else 30.0
-            )
+        Startup-Default 30°C (sicher warm) bis erster gueltiger Wert empfangen wird.
+        Fuer EINSCHALT-Checks (_need_heating/_need_buffer_drain) ist 'warm' die sichere
+        Richtung; Abschalt-Checks nutzen stattdessen _sensor_value_or_none() direkt."""
+        val = self._sensor_value_or_none(
+            self._sensor_outdoor_temp, "_outdoor_temp_cache"
+        )
+        return val if val is not None else 30.0
 
     def _outdoor_temp_1h(self) -> float:
         """1h-Mittelwert AT fuer Exit-Entscheidungen (schneller als EMA).
         Fallback-Cache wie _outdoor_temp(); Startup-Default 30°C (sicher warm)."""
-        raw = self.get_state(self._sensor_outdoor_temp_1h)
-        try:
-            val = float(raw)
-            self._outdoor_temp_1h_cache = val
-            return val
-        except (TypeError, ValueError):
-            return (
-                self._outdoor_temp_1h_cache
-                if self._outdoor_temp_1h_cache is not None
-                else 30.0
-            )
+        val = self._sensor_value_or_none(
+            self._sensor_outdoor_temp_1h, "_outdoor_temp_1h_cache"
+        )
+        return val if val is not None else 30.0
 
     def _flow_temp(self) -> float:
         """Letzten gueltigen VL-Wert cachen. Gibt None zurueck wenn nie ein gueltiger
@@ -2249,10 +2312,23 @@ class HeatpumpFSM(FSMBase):
         return self.get_numeric_state(self._sensor_wp_inlet_temp, default=0.0)
 
     def _buffer_bottom(self) -> float:
-        return self.get_numeric_state(self._sensor_buffer_bottom, default=35.0)
+        val = self._sensor_value_or_none(
+            self._sensor_buffer_bottom, "_buffer_bottom_cache"
+        )
+        return val if val is not None else 35.0
 
     def _buffer_mid(self) -> float:
-        return self.get_numeric_state(self._sensor_buffer_mid, default=40.0)
+        val = self._sensor_value_or_none(self._sensor_buffer_mid, "_buffer_mid_cache")
+        return val if val is not None else 40.0
+
+    def _buffer_mid_valid(self) -> bool:
+        """True wenn fuer Puffer 1/2 jemals ein gueltiger Wert vorlag (Cache gefuellt).
+        Nach (Neu-)Start False bis der erste ESPHome-Wert eintrifft -> Schaltentscheidungen
+        die buffer_mid brauchen, treffen in diesem Fenster keine Aktion (halten Zustand)."""
+        return (
+            self._sensor_value_or_none(self._sensor_buffer_mid, "_buffer_mid_cache")
+            is not None
+        )
 
     def _buffer_mid_high(self) -> float:
         return self.get_numeric_state(self._sensor_buffer_mid_high, default=44.0)
