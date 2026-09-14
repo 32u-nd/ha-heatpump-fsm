@@ -236,26 +236,26 @@ fsm_heatpump:
 
     # ── PI-Regler Mischer ───────────────────────────────────────────────────────
     hp_mixer_kp:
-      name: "Mischer Kp (proportional)"
+      name: "Mischer Trim Kp (proportional)"
       min: 0.0
-      max: 2.0
-      step: 0.1
+      max: 1.0
+      step: 0.05
       unit_of_measurement: "%pt/°C"
       icon: mdi:tune-vertical
       mode: slider
 
     hp_mixer_ki:
-      name: "Mischer Ki (integral)"
+      name: "Mischer Trim Ki (integral)"
       min: 0.0
-      max: 2.0
-      step: 0.1
+      max: 0.1
+      step: 0.005
       unit_of_measurement: "%pt/°C"
       icon: mdi:tune-vertical-variant
       mode: slider
 
     hp_mixer_interval_s:
       name: "Mischer Regelzyklus"
-      min: 0
+      min: 5
       max: 30
       step: 5
       unit_of_measurement: "s"
@@ -279,6 +279,42 @@ fsm_heatpump:
       unit_of_measurement: "%"
       icon: mdi:valve-open
       mode: slider
+
+    hp_mixer_dt_min:
+      name: "Mischer FF min. (Tank-RL)"
+      min: 2
+      max: 15
+      step: 1
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-minus
+      mode: slider
+
+    hp_mixer_trim_limit_pct:
+      name: "Mischer Trim-Limit"
+      min: 5
+      max: 40
+      step: 1
+      unit_of_measurement: "%"
+      icon: mdi:arrow-expand-vertical
+      mode: slider
+
+    # ── Ventil-Kalibrierung (FOPDT-Stufentest) ─────────────────────────────────
+    # Haltezeit je Stufe: FOPDT-Sprungantwort erreicht ~99% bei t = Totzeit + 5*tau.
+    # Mit Totzeit=2.3min, tau=6.4min (Charakterisierung RL-Strecke) -> ~34.3min,
+    # aufgerundet 35min Default. NICHT 5*Totzeit (=11.5min) - das waere nur ~76%
+    # eingeschwungen (siehe Session 12.09).
+    # Kurzversion (weniger Waermeverbrauch): ~20min reichen, wenn danach mit
+    # mixer_fopdt_fit.py der Endwert + L/tau aus der Anstiegsflanke GESCHAETZT
+    # statt abgewartet wird (Grid-Search-Fit statt volles Einschwingen).
+    hp_mixer_calibration_hold_min:
+      name: "Mischer-Kalibrierung Haltezeit je Stufe"
+      min: 10
+      max: 60
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-sand
+      mode: box
+      initial: 35
 
     # ── Mindestlaufzeit & Verdichterschutz ─────────────────────────────────────
     hp_min_runtime_minutes:
@@ -370,6 +406,37 @@ fsm_heatpump:
       icon: mdi:test-tube
       # EIN: FSM rechnet alles durch, kein Modbus-Write
       # AUS: Normalbetrieb
+
+    hp_mixer_ff:
+      name: "Mischer Feedforward"
+      icon: mdi:function-variant
+      initial: true
+      # EIN: FF (invertierte Mischgleichung) + langsamer PI-Trim
+      # AUS: nur PI-Trim um die zuletzt gehaltene FF-Position (A/B-Test)
+
+    hp_mixer_calibration_run:
+      name: "Mischer-Kalibrierung starten (FOPDT-Stufentest)"
+      icon: mdi:play-box-outline
+      # EIN -> löst Automation "Mischer Kalibrierung: FOPDT-Stufentest" aus.
+      # Schaltet sich am Ende der Automation selbst wieder aus.
+
+  input_text:
+    hp_mixer_calibration_step:
+      name: "Mischer-Kalibrierung aktuelle Stufe"
+      icon: mdi:stairs
+      initial: "idle"
+      # Marker fuer mixer_kalibrierung.sh: jede Wertaenderung ist ein exakter
+      # Zeitstempel in der recorder-DB (states-Tabelle), an dem die Automation
+      # eine neue Sollposition angefahren hat. Werte: "0".."100" (Stufe in %),
+      # "start"/"done" als Rahmenmarken.
+
+    hp_mixer_calibration_steps:
+      name: "Mischer-Kalibrierung Stufenliste"
+      icon: mdi:format-list-numbered
+      initial: "0,20,40,60,80,100"
+      max: 100
+      # Komma-getrennte Liste der anzufahrenden Positionen (%), z.B. "60,80,100"
+      # fuer eine Nachmessung nur des oberen Bereichs (spart Zeit + Waerme).
 
   input_datetime:
     hp_hw_morning_weekday:
@@ -576,3 +643,69 @@ fsm_heatpump:
                 entity_id: input_number.hp_at_ema_value
               data:
                 value: "{{ (alpha * at_now + (1 - alpha) * ema_prev) | round(2) }}"
+
+    - alias: "Mischer Kalibrierung: FOPDT-Stufentest"
+      description: >
+        Ventil-Kennlinien-Test: FSM auf Dry-Run (kein Modbus/Cover/Pumpen-Write
+        durch die FSM selbst), Grundfos-Pumpe manuell an, Mischer faehrt die
+        Stufen aus hp_mixer_calibration_steps ab (Default "0,20,40,60,80,100" -
+        fuer eine Nachmessung nur "60,80,100" setzen, spart Zeit + Waerme).
+        Haltezeit je Stufe = hp_mixer_calibration_hold_min. Fuer volles
+        Einschwingen (~99%) Totzeit+5*tau der Strecke verwenden (mit L=2.3min/
+        tau=6.4min ~35min); fuer eine Kurzversion mit anschliessender FOPDT-
+        Parameterschaetzung (mixer_fopdt_fit.py, Grid-Search-Fit statt Warten)
+        reichen ~20min, sofern genug Punkte der Anstiegsflanke sichtbar sind.
+        input_text.hp_mixer_calibration_step ist die Zeitmarke fuer
+        mixer_kalibrierung.sh / mixer_export_raw.sh (jede Wertaenderung =
+        exakter Zeitstempel in der recorder-DB).
+        WICHTIG danach: dry_run ist am Ende aus, aber der interne PI-Regler
+        (_pi_position) kennt die manuellen Stufen nicht - beim naechsten
+        Zustandseintritt (on_enter_heating/buffer_drain) wird die reale
+        Cover-Position neu eingelesen, siehe _pi_start_position().
+      mode: single
+      triggers:
+        - trigger: state
+          entity_id: input_boolean.hp_mixer_calibration_run
+          to: "on"
+      actions:
+        - action: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.hp_dry_run
+        - action: switch.turn_on
+          target:
+            entity_id: switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.hp_mixer_calibration_step
+          data:
+            value: "start"
+        - variables:
+            step_list: >-
+              {{ (states('input_text.hp_mixer_calibration_steps')
+                  | default('0,20,40,60,80,100'))
+                 .split(',') | map('trim') | map('int') | list }}
+        - repeat:
+            for_each: "{{ step_list }}"
+            sequence:
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.hp_mixer_calibration_step
+                data:
+                  value: "{{ repeat.item }}"
+              - action: cover.set_cover_position
+                target:
+                  entity_id: cover.lg_thermav_circuit_2_1e6134_rl_mischer
+                data:
+                  position: "{{ repeat.item }}"
+              - delay: "{{ (states('input_number.hp_mixer_calibration_hold_min') | int(35)) * 60 }}"
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.hp_mixer_calibration_step
+          data:
+            value: "done"
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.hp_dry_run
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.hp_mixer_calibration_run

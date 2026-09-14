@@ -180,12 +180,15 @@ class HeatpumpFSM(FSMBase):
         "hw_evening_h": 21,
         "hw_evening_m": 0,
         "hw_duration_minutes": 60,
-        "mixer_kp": 0.5,
-        "mixer_ki": 0.1,
+        # Mischer: Feedforward (invertierte Mischgleichung) + langsamer PI-Trim.
+        # kp/ki sind jetzt der TRIM-Regler auf das Residuum (FF leistet den Grundhub).
+        "mixer_kp": 0.4,          # Trim-Proportional %/°C (war 0.5 voller PI)
+        "mixer_ki": 0.01,         # Trim-Integral %/°C/Zyklus -> T_i = kp*Ts/ki = 200s
         "mixer_interval_s": 5.0,
         "mixer_max_step_pct": 4.0,
         "mixer_warmstart_position": 20.0,
-        # velocity-form PI: kein Integral-Akkumulator noetig
+        "mixer_dt_min": 6.0,            # min. (T_Tank-T_RL) bevor FF rechnet (sonst voll auf)
+        "mixer_trim_limit_pct": 15.0,  # max. |Trim| um den FF-Arbeitspunkt
         "min_runtime_minutes": 45.0,
         "standby_minutes": 3.0,
         "forced_setpoint_offset": 1.0,
@@ -248,6 +251,10 @@ class HeatpumpFSM(FSMBase):
         self._sensor_pv_energy_kwh = self.args["sensor_pv_energy_kwh"]
         self._sensor_flow_temp = self.args["sensor_flow_temp"]
         self._sensor_return_temp = self.args.get("sensor_return_temp", "")
+        # Heizkreis-Ruecklauf (Kalt-Eingang des Mischers) - fuer Mischer-Feedforward
+        self._sensor_mixer_return_temp = self.args.get(
+            "sensor_mixer_return_temp", "sensor.hp_temp_sensors_2036e1_heizung_rl"
+        )
         self._sensor_wp_leaving_temp = self.args.get("sensor_wp_leaving_temp", "")
         self._sensor_buffer_bottom = self.args["sensor_buffer_bottom"]
         self._sensor_buffer_mid = self.args["sensor_buffer_mid"]
@@ -302,6 +309,12 @@ class HeatpumpFSM(FSMBase):
             "dry_run_entity", "input_boolean.hp_dry_run"
         )
 
+        # -- Mischer-Feedforward Toggle (A/B-Test) -----------------------------
+        # Wenn Entity fehlt oder nicht 'off' -> FF aktiv.
+        self._mixer_ff_entity = self.args.get(
+            "mixer_ff_entity", "input_boolean.hp_mixer_ff"
+        )
+
         # -- Dashboard-Visualisierung ------------------------------------------
         self._input_pi_position = self.args.get(
             "input_pi_position", "input_number.hp_mischer_pi_position"
@@ -328,10 +341,14 @@ class HeatpumpFSM(FSMBase):
         self._ha_param_prefix = self.args.get("ha_param_prefix", "input_number.hp_")
 
         # -- Interne Zustaende --------------------------------------------------
-        self._pi_prev_error = 0.0  # velocity-form PI: vorheriger Fehler
+        self._pi_prev_error = 0.0  # (Legacy) vorheriger Fehler - vom Trim nicht genutzt
         self._pi_position = (
             50.0  # wird in on_enter_heating/buffer_drain aus Cover gelesen
         )
+        # Mischer Feedforward + Trim
+        self._mixer_ff_base = 0.0      # Feedforward-Stellung (% aus invertierter Mischgleichung)
+        self._mixer_trim_i = 0.0       # Trim-Integrator (%)
+        self._mixer_trim_init = True   # erster Step nach Start: bumpless initialisieren
         self._mixer_handle = None
         self._forced_lp_value = None
         self._decay_start_time = None   # Zeitstempel: Beginn Phase-2-Absenkung
@@ -355,6 +372,7 @@ class HeatpumpFSM(FSMBase):
         self._flow_temp_cache: float | None = None  # letzter gueltiger VL-Wert
         self._buffer_mid_cache: float | None = None  # letzter gueltiger Puffer-1/2-Wert
         self._buffer_bottom_cache: float | None = None  # letzter gueltiger Puffer-1/4-Wert
+        self._mixer_return_cache: float | None = None  # letzter gueltiger Heizkreis-RL-Wert
         self._compressor_starts: collections.deque = collections.deque()  # Takt-Schutz
         self._last_wp_mode_log: str | None = None  # Deduplizierung: letzter Modbus-Log
         self._last_pi_position: float | None = None  # letzte PI-Gleichgewichtsposition vor Schliessen
@@ -526,6 +544,76 @@ class HeatpumpFSM(FSMBase):
     @property
     def _circuit1_offset(self) -> float:
         return self._get_param("circuit1_offset")
+
+    def _mixer_ff_enabled(self) -> bool:
+        """Feedforward aktiv, ausser die Toggle-Entity steht explizit auf 'off'."""
+        if not self._mixer_ff_entity:
+            return True
+        try:
+            return self.get_state(self._mixer_ff_entity) != "off"
+        except Exception:
+            return True
+
+    def _mixer_return_temp(self):
+        """Heizkreis-RL (Kalt-Eingang Mischer) als float oder None (mit Cache)."""
+        return self._sensor_value_or_none(
+            self._sensor_mixer_return_temp, "_mixer_return_cache"
+        )
+
+    # Ventil-Kennlinie (Stufentests 12.09., mixer_kalibrierung.sh / mixer_export_raw.sh +
+    # mixer_hammerstein_fit.py):
+    # (Mischverhaeltnis 0-1 = (VL-RL)/(Tank-RL), tatsaechlich noetige Stellung %).
+    # 20%->0.034, 40%->0.223, 60%->0.550 gemessen (Test 1, 35min Haltezeit, letzte
+    # 5min gemittelt, ueber mehrere Auswertemethoden konsistent). Deutliche
+    # Totzone/geringe Autoritaet im unteren Drittel - Ventil braucht bei kleinem
+    # Soll-Mischverhaeltnis deutlich mehr Stellung als linear angenommen.
+    # 80% NICHT gemessen: Test 2 (20min Haltezeit) durch WW-Zapfung waehrend der
+    # 80%-Stufe gestoert (Tank-Schichtung gestoert, Sensor 2/4 nicht mehr
+    # repraesentativ fuer Mischer-Zulauf -> alle 3 Auswertemethoden inkl.
+    # Hammerstein-Fit mit fixiertem L/tau lieferten unplausible/instabile Werte,
+    # s. Session 12.09.). 80% daher linear zwischen 60% und 100% interpoliert
+    # (0.78) statt gemessen - Platzhalter bis zu einer stoerungsfreien Nachmessung.
+    # Randpunkte (0,0)/(1,100) sind Modellannahme (volle Endanschlaege), nicht
+    # gemessen.
+    _VALVE_CAL = (
+        (0.000, 0.0),    # Randannahme
+        (0.003, 5.0),    # Modell (Hill-Sigmoid-Fit)
+        (0.010, 10.0),   # Modell
+        (0.024, 15.0),   # Modell
+        (0.034, 20.0),   # gemessen
+        (0.072, 25.0),   # Modell
+        (0.110, 30.0),   # Modell
+        (0.158, 35.0),   # Modell
+        (0.223, 40.0),   # gemessen
+        (0.288, 45.0),   # Modell
+        (0.369, 50.0),   # Modell
+        (0.458, 55.0),   # Modell
+        (0.550, 60.0),   # gemessen
+        (0.646, 65.0),   # Modell
+        (0.735, 70.0),   # Modell
+        (0.815, 75.0),   # Modell
+        (0.882, 80.0),   # Modell
+        (0.934, 85.0),   # Modell
+        (0.971, 90.0),   # Modell
+        (0.992, 95.0),   # Modell
+        (1.000, 100.0),  # Randannahme
+    )
+
+    def _valve_position_for_ratio(self, ratio_pct: float) -> float:
+        """Invertiert die (nichtlineare) Ventilkennlinie: gewuenschtes
+        Mischverhaeltnis [0..100]% -> tatsaechlich noetige Stellposition [0..100]%,
+        stueckweise linear interpoliert ueber _VALVE_CAL."""
+        ratio = max(0.0, min(1.0, ratio_pct / 100.0))
+        table = self._VALVE_CAL
+        if ratio <= table[0][0]:
+            return table[0][1]
+        for (r0, p0), (r1, p1) in zip(table, table[1:]):
+            if ratio <= r1:
+                if r1 == r0:
+                    return p1
+                frac = (ratio - r0) / (r1 - r0)
+                return p0 + frac * (p1 - p0)
+        return table[-1][1]
 
     @property
     def _mixer_kp(self) -> float:
@@ -1151,6 +1239,8 @@ class HeatpumpFSM(FSMBase):
 
     def _start_mixer_controller(self):
         self._stop_mixer_controller()
+        # Bumpless: erster Step initialisiert Trim so, dass Gesamtstellung = reale Position
+        self._mixer_trim_init = True
         self._mixer_handle = self.run_every(
             self._mixer_pi_step, self.datetime(), self._mixer_interval_s
         )
@@ -1188,21 +1278,60 @@ class HeatpumpFSM(FSMBase):
         setpoint = self._calc_flow_setpoint_smoothed()
         actual = self._flow_temp()
         e = setpoint - actual
-        # velocity-form PI: delta = kp*(e - e_prev) + ki*e
-        # Step-Limit: verhindert Ueberschwingen durch Stellantrieb-Verzoegerung (123s Vollhub).
-        de = e - self._pi_prev_error
-        delta = self._mixer_kp * de + self._mixer_ki * e
+        kp = self._mixer_kp
+        ki = self._mixer_ki
+        limit = self._get_param("mixer_trim_limit_pct")
+
+        # --- Feedforward: invertierte Mischgleichung -------------------------
+        # VL = x*T_Tank + (1-x)*T_RL  ->  u_ff[%] = 100*(VL_Soll - T_RL)/(T_Tank - T_RL)
+        # Nutzt aktuelle Messwerte -> kompensiert Verstaerkungs-Spreizung (ueber dT)
+        # und die RL-Rezirkulation direkt. Bei ungueltigen Fuehlern: letzten FF-Wert halten.
+        t_tank = self._sensor_value_or_none(
+            self._sensor_buffer_mid, "_buffer_mid_cache"
+        )
+        t_rl = self._mixer_return_temp()
+        ff_base = self._mixer_ff_base
+        if self._mixer_ff_enabled() and t_tank is not None and t_rl is not None:
+            dt = t_tank - t_rl
+            dt_min = self._get_param("mixer_dt_min")
+            if dt < dt_min:
+                # Tank kaum waermer als RL -> Soll nicht erreichbar: voll auf (warm) bzw. zu
+                ff_base = 100.0 if (setpoint - t_rl) > 0 else 0.0
+            else:
+                ratio = max(0.0, min(100.0, 100.0 * (setpoint - t_rl) / dt))
+                # Ratio (physikalisches Mischverhaeltnis) -> noetige Stellposition
+                # ueber die gemessene Ventilkennlinie (siehe _VALVE_CAL).
+                ff_base = self._valve_position_for_ratio(ratio)
+        self._mixer_ff_base = ff_base
+
+        # --- Bumpless-Init: Trim so, dass Gesamtstellung = reale Position ----
+        if self._mixer_trim_init:
+            self._mixer_trim_i = max(
+                -limit, min(limit, self._pi_position - ff_base - kp * e)
+            )
+            self._mixer_trim_init = False
+
+        # --- Langsamer PI-Trim auf das Residuum ------------------------------
+        total_unclamped = ff_base + kp * e + self._mixer_trim_i + ki * e
+        # Anti-Windup: nur integrieren wenn Ausgang nicht in Fehlerrichtung saturiert
+        if (
+            0.0 < total_unclamped < 100.0
+            or (total_unclamped <= 0.0 and e > 0)
+            or (total_unclamped >= 100.0 and e < 0)
+        ):
+            self._mixer_trim_i = max(-limit, min(limit, self._mixer_trim_i + ki * e))
+        trim = max(-limit, min(limit, kp * e + self._mixer_trim_i))
+
+        # --- Slew-Limit (Stellantrieb 123s Vollhub) + Clamp ------------------
+        u_raw = max(0.0, min(100.0, ff_base + trim))
         max_step = self._get_param("mixer_max_step_pct")
-        delta = max(-max_step, min(max_step, delta))
-        self._pi_prev_error = e
         old_pos = self._pi_position
+        delta = max(-max_step, min(max_step, u_raw - old_pos))
         new_pos = max(0.0, min(100.0, old_pos + delta))
-        # Sub-1%-Akkumulation: _pi_position immer aktualisieren,
-        # Cover-Befehl nur bei Aenderung des ganzzahligen Wertes.
         self._pi_position = new_pos
         self.log(
-            f"[Mischer] Soll={setpoint:.1f}C Ist={actual:.1f}C "
-            f"e={e:+.1f}C de={de:+.2f} delta={delta:+.2f} "
+            f"[Mischer] Soll={setpoint:.1f}C Ist={actual:.1f}C e={e:+.1f}C | "
+            f"FF={ff_base:.1f}% Trim={trim:+.1f}%(I={self._mixer_trim_i:+.1f}) | "
             f"Pos: {old_pos:.1f}%->{new_pos:.1f}%",
             level="DEBUG",
         )

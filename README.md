@@ -11,7 +11,7 @@ LG ThermaV Wärmepumpe über Modbus TCP in Home Assistant. Läuft als AppDaemon-
 
 ### Funktionsumfang
 
-- **Heizbetrieb** nach adaptiver Heizkurve mit gedämpfter Witterungsführung (AT-EMA, τ einstellbar) und PI-geregeltem 3-Wege-Mischer
+- **Heizbetrieb** nach adaptiver Heizkurve mit gedämpfter Witterungsführung (AT-EMA, τ einstellbar) und feedforward-gestütztem 3-Wege-Mischer (invertierte Mischgleichung + PI-Trim)
 - **Puffer-Entladung** — Haus heizen ohne Verdichter, solange Puffer warm genug
 - **PV-Überschussladung** — Pufferspeicher mit Photovoltaik-Überschuss laden (40002=1 Einlass-Regelung)
 - **Heizstab-Boost** — bei hohem PV-Überschuss Puffer auf 55 °C laden (inkl. Heizstab)
@@ -48,7 +48,7 @@ FSMBase (fsm_base.py)
 │
 └── HeatpumpFSM (heatpump_fsm.py)
       ├── Heizkurve (2-Punkt-linear + PV-Korrektur, Sollwert EWMA-gedämpft)
-      ├── Mischer-PI (velocity-form, Step-Limit, Sub-1%-Akkumulation)
+      ├── Mischer-Regelung (Feedforward + PI-Trim, Step-Limit, Anti-Windup, Bumpless-Init)
       ├── Pufferspeicher-Zonenlogik (4 Temperatursensoren)
       ├── PV-Überschussladung (40002=1, Einlass-Regelung)
       ├── WW-Zeitplanung (3 Fenster, Werktag/Wochenende)
@@ -130,15 +130,24 @@ VL_Soll  = EWMA(VL_roh, α = setpoint_ewma_alpha)          ← Sollwert-Glättun
 - PV: bereits ein 15-min-Mittelwert — kein zusätzliches EWMA auf PV nötig.
 - **Sollwert-EWMA** (α = 0,1, Zeitkonstante ≈ 45 s): der fertige Sollwert wird gedämpft bevor er in PI-Regler und 40006 geht. Schwellen-Berechnungen nutzen den Roh-Sollwert (keine Glättungsverzögerung bei Zustandswechseln).
 
-#### Mischer-PI (velocity-form)
+#### Mischer: Feedforward + PI-Trim
 
 ```
+FF   = 100 × (VL_Soll − T_RL) / (T_Tank − T_RL)      ← invertierte Mischgleichung
+       (T_Tank − T_RL) < dt_min → FF = 100 % bzw. 0 %  (Soll ohnehin nicht erreichbar)
+       Ratio → Ventilposition über gemessene Ventilkennlinie (_VALVE_CAL)
 e     = VL_Soll − VL_Ist
-delta = kp × (e − e_prev) + ki × e          ← velocity-form, kein Integral-Akkumulator
-delta = clamp(delta, −max_step, +max_step)   ← Step-Limit gegen Überschwingen
-pos   = clamp(pos + delta, 0, 100) %
+trim  = clamp(kp × e + trim_i, −trim_limit, +trim_limit)   ← langsamer PI auf das Residuum
+pos   = clamp(FF + trim, 0, 100) %, danach Step-Limit (±max_step) auf die alte Position
 ```
 
+Die Feedforward-Stufe rechnet aus den aktuellen Temperaturen (Puffer-Mitte `T_Tank`,
+Heizkreis-Rücklauf `T_RL`) direkt die nötige Ventilstellung — kompensiert Verstärkungs-Spreizung
+über ΔT und RL-Rezirkulation, bevor der Regler überhaupt eingreifen muss. Der PI-Trim
+(`kp`/`ki`) korrigiert nur noch das Residuum und ist per Anti-Windup gegen Sättigung
+geschützt. Ein Toggle (`input_boolean.hp_mixer_ff`) erlaubt A/B-Tests: aus → reiner Trim-Regler
+auf den vollen Fehler. Bumpless-Init setzt den Trim-Integrator beim ersten Zyklus so, dass
+FF + Trim der realen Ist-Position entspricht (kein Sprung).
 Cover-Befehl nur bei Änderung des ganzzahligen Werts (Sub-1%-Akkumulation).
 Step-Limit ≈ 4 % (= 100 % / Stellantrieb-Laufzeit × Regelzyklus).
 
@@ -177,14 +186,17 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | `hp_buffer_drain_margin` | 3 °C | Abstand der EIN-Schwelle über Heizkurve |
 | `hp_buffer_drain_hyst` | 2 °C | Totband EIN/AUS |
 
-#### Mischer-PI
+#### Mischer: Feedforward + Trim
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `hp_mixer_kp` | 0,5 %/°C | Proportionalanteil |
-| `hp_mixer_ki` | 0,1 %/°C | Integralanteil |
+| `hp_mixer_kp` | 0,4 %/°C | Trim-Proportionalanteil (auf Residuum nach FF) |
+| `hp_mixer_ki` | 0,01 %/°C | Trim-Integralanteil (T_i = kp×Ts/ki ≈ 200 s) |
+| `hp_mixer_dt_min` | 6 °C | Min. (T_Tank−T_RL) bevor FF rechnet, sonst voll auf/zu |
+| `hp_mixer_trim_limit_pct` | 15 % | Max. \|Trim\| um den FF-Arbeitspunkt |
 | `hp_mixer_interval_s` | 5 s | Regelzyklus |
 | `hp_mixer_max_step_pct` | 4 % | Max-Schritt pro Zyklus |
 | `hp_mixer_warmstart_position` | 20 % | Startposition wenn Mischer war zu |
+| `input_boolean.hp_mixer_ff` | AN | Feedforward-Toggle (aus = reiner Trim-Regler, A/B-Test) |
 
 #### Verdichterschutz
 | Parameter | Default | Beschreibung |
@@ -280,7 +292,7 @@ heat pump via Modbus TCP in Home Assistant. Runs as an AppDaemon app (Docker).
 
 ### Features
 
-- **Heating mode** following an adaptive heating curve with smoothed weather compensation (OAT EMA, configurable time constant) and PI-controlled 3-way mixer
+- **Heating mode** following an adaptive heating curve with smoothed weather compensation (OAT EMA, configurable time constant) and a feedforward-assisted 3-way mixer (inverted mixing equation + PI trim)
 - **Buffer drain** — heat the house without the compressor while the buffer is warm enough
 - **PV surplus charging** — charge buffer storage with photovoltaic surplus (Modbus 40002=1 inlet control)
 - **Heating element boost** — charge buffer to 55 °C with high PV surplus (including heating rod)
@@ -317,7 +329,7 @@ FSMBase (fsm_base.py)
 │
 └── HeatpumpFSM (heatpump_fsm.py)
       ├── Heating curve (2-point linear + PV correction, setpoint EWMA-smoothed)
-      ├── Mixer PI controller (velocity-form, step limit, sub-1% accumulation)
+      ├── Mixer control (feedforward + PI trim, step limit, anti-windup, bumpless init)
       ├── Buffer storage zone logic (4 temperature sensors)
       ├── PV surplus charging (40002=1, inlet control)
       ├── DHW scheduling (3 windows, weekday/weekend)
@@ -399,15 +411,24 @@ SP_flow  = EWMA(SP_raw, α = setpoint_ewma_alpha)           ← setpoint smoothi
 - PV: already a 15-min average — no additional EWMA on PV needed.
 - **Setpoint EWMA** (α = 0.1, time constant ≈ 45 s): final setpoint is smoothed before being sent to PI controller and register 40006. Threshold calculations use the raw setpoint (no lag for state transitions).
 
-#### Mixer PI Controller (velocity-form)
+#### Mixer: Feedforward + PI Trim
 
 ```
+FF   = 100 × (SP_flow − T_return) / (T_tank − T_return)   ← inverted mixing equation
+       (T_tank − T_return) < dt_min → FF = 100 % or 0 %     (setpoint unreachable anyway)
+       ratio → valve position via measured valve characteristic (_VALVE_CAL)
 e     = SP_flow − T_flow_actual
-delta = kp × (e − e_prev) + ki × e          ← velocity-form, no integral accumulator
-delta = clamp(delta, −max_step, +max_step)   ← step limit prevents overshoot
-pos   = clamp(pos + delta, 0, 100) %
+trim  = clamp(kp × e + trim_i, −trim_limit, +trim_limit)    ← slow PI on the residual
+pos   = clamp(FF + trim, 0, 100) %, then step limit (±max_step) around the previous position
 ```
 
+The feedforward stage computes the required valve position directly from current
+temperatures (buffer mid `T_tank`, heating-circuit return `T_return`) — compensating gain
+spread across ΔT and return-line recirculation before the controller has to act at all. The
+PI trim (`kp`/`ki`) only corrects the residual and is anti-windup protected against
+saturation. A toggle (`input_boolean.hp_mixer_ff`) enables A/B testing: off → plain trim
+controller on the full error. Bumpless init sets the trim integrator on the first cycle so
+FF + trim matches the real actual position (no jump).
 Cover command only on integer position change (sub-1% accumulation in float).
 Step limit ≈ 4 % (= 100 % / actuator travel time × control cycle).
 
@@ -442,14 +463,17 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | `hp_buffer_drain_margin` | 3 °C | ON-threshold margin above heating curve |
 | `hp_buffer_drain_hyst` | 2 °C | Dead band between ON and OFF |
 
-#### Mixer PI
+#### Mixer: Feedforward + Trim
 | Parameter | Default | Description |
 |---|---|---|
-| `hp_mixer_kp` | 0.5 %/°C | Proportional gain |
-| `hp_mixer_ki` | 0.1 %/°C | Integral gain |
+| `hp_mixer_kp` | 0.4 %/°C | Trim proportional gain (on residual after FF) |
+| `hp_mixer_ki` | 0.01 %/°C | Trim integral gain (T_i = kp×Ts/ki ≈ 200 s) |
+| `hp_mixer_dt_min` | 6 °C | Min. (T_tank−T_return) before FF computes, else fully open/closed |
+| `hp_mixer_trim_limit_pct` | 15 % | Max \|trim\| around the FF operating point |
 | `hp_mixer_interval_s` | 5 s | Control cycle |
 | `hp_mixer_max_step_pct` | 4 % | Max step per cycle |
 | `hp_mixer_warmstart_position` | 20 % | Start position when mixer was closed |
+| `input_boolean.hp_mixer_ff` | ON | Feedforward toggle (off = plain trim controller, A/B test) |
 
 #### Compressor protection
 | Parameter | Default | Description |

@@ -10,6 +10,7 @@ hello_world:
 heatpump_fsm:
   module: heatpump_fsm
   class: HeatpumpFSM
+  log_level: DEBUG
   ha_param_prefix: "input_number.hp_"
 
   # ── Sensoren ────────────────────────────────────────────────
@@ -20,6 +21,8 @@ heatpump_fsm:
   sensor_pv_energy_kwh:   sensor.energy_production_today_remaining
   sensor_flow_temp:       sensor.hp_temp_sensors_2036e1_heizung_vl
   sensor_return_temp:     sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
+  # Heizkreis-Ruecklauf (Kalt-Eingang des Mischers) - Mischer-Feedforward (T_RL)
+  sensor_mixer_return_temp: sensor.hp_temp_sensors_2036e1_heizung_rl
   sensor_wp_leaving_temp: sensor.hp_temp_sensors_2036e1_hydrobox_auslauf_zu_tank
   sensor_buffer_bottom:   sensor.hp_temp_sensors_2036e1_tank_1_4
   sensor_buffer_mid:      sensor.hp_temp_sensors_2036e1_tank_2_4

@@ -212,27 +212,42 @@ views:
             name: Heizstab Stufe 2 (6 kW)
             icon: mdi:heating-coil
           - type: section
-            label: Mischer
+            label: Mischer (Feedforward + Trim)
+          # — Überwachung —
           - entity: cover.lg_thermav_circuit_2_1e6134_rl_mischer
             name: Mischersteuerung
             icon: mdi:valve
           - entity: sensor.mischer_ist_position
-            name: Mischer Ist
+            name: Mischer Ist-Position
             icon: mdi:valve
           - entity: input_number.hp_mischer_pi_position
-            name: Mischer Soll (PI)
+            name: Mischer Soll-Position (FF+Trim)
             icon: mdi:valve-open
+          - entity: sensor.hp_temp_sensors_2036e1_tank_2_4
+            name: T_Tank — Puffer 1/2 (FF-Warm)
+            icon: mdi:thermometer-chevron-up
+          - entity: sensor.hp_temp_sensors_2036e1_heizung_rl
+            name: T_RL — Heizkreis-Rücklauf (FF-Kalt)
+            icon: mdi:thermometer-chevron-down
+          # — Steuerung & Tuning —
+          - entity: input_boolean.hp_mixer_ff
+            name: Feedforward aktiv
+            icon: mdi:function-variant
           - entity: input_number.hp_mixer_kp
-            name: Kp (Proportional)
+            name: Trim Kp (Proportional)
             mode: slider
           - entity: input_number.hp_mixer_ki
-            name: Ki (Integral)
+            name: Trim Ki (Integral)
             mode: slider
+          - entity: input_number.hp_mixer_trim_limit_pct
+            name: Trim-Limit (±%)
+            mode: slider
+          - entity: input_number.hp_mixer_dt_min
+            name: FF min. ΔT (Tank−RL)
+            mode: slider
+          # — Setup (selten ändern) —
           - entity: input_number.hp_mixer_interval_s
-            name: Regelzyklus (s)
-            mode: slider
-          - entity: input_number.hp_mixer_max_step_pct
-            name: Max-Schritt/Zyklus (%)
+            name: Regelzyklus
             mode: slider
           - type: section
             label: Hydrobox & Druck
