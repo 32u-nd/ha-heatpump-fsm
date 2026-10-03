@@ -6,7 +6,7 @@ views:
     cards:
       - type: custom:mushroom-template-card
         primary: FSM Zustand
-        secondary: "{{ states('input_select.heatpump_state') }}"
+        secondary: '{{ states(''input_select.heatpump_state'') }}'
         icon: >
           {% set s = states('input_select.heatpump_state') %} {% if s ==
           'heating' %} mdi:radiator {% elif s == 'heating_forced' %}
@@ -67,11 +67,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 40
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 50
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_3_4
             name: 3/4
@@ -80,11 +80,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 36
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 44
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_2_4
             name: 1/2 (VL)
@@ -93,11 +93,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 36
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 46
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.hp_temp_sensors_2036e1_tank_1_4
             name: 1/4 (unten)
@@ -106,41 +106,41 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 30
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 36
-                color: "#3B875E"
+                color: '#3B875E'
       - type: horizontal-stack
         cards:
           - type: gauge
             entity: sensor.wp_arbeitszahl_15m_fallback
             name: COP (15m)
-            unit: " "
+            unit: ' '
             min: 2.5
             max: 5
             needle: true
             segments:
               - from: 2.5
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 3
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 4
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.wp_arbeitszahl_1d_fallback
             name: COP (1d)
-            unit: " "
+            unit: ' '
             min: 2.5
             max: 5
             needle: true
             segments:
               - from: 2.5
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 3
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 4
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.carnot_effizienz_15m_fallback
             name: Carnot (15m)
@@ -149,11 +149,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 40
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 60
-                color: "#3B875E"
+                color: '#3B875E'
           - type: gauge
             entity: sensor.carnot_effizienz_1d_fallback
             name: Carnot (1d)
@@ -162,11 +162,11 @@ views:
             needle: true
             segments:
               - from: 0
-                color: "#BF3B37"
+                color: '#BF3B37'
               - from: 40
-                color: "#FCCF49"
+                color: '#FCCF49'
               - from: 60
-                color: "#3B875E"
+                color: '#3B875E'
       - type: entities
         title: 🔄 Betriebsstatus
         show_header_toggle: false
@@ -213,23 +213,21 @@ views:
             icon: mdi:heating-coil
           - type: section
             label: Mischer (Feedforward + Trim)
-          # — Überwachung —
           - entity: cover.lg_thermav_circuit_2_1e6134_rl_mischer
             name: Mischersteuerung
             icon: mdi:valve
           - entity: sensor.mischer_ist_position
-            name: Mischer Ist-Position
+            name: Mischer Ist
             icon: mdi:valve
           - entity: input_number.hp_mischer_pi_position
-            name: Mischer Soll-Position (FF+Trim)
+            name: Mischer Soll (kommandiert)
             icon: mdi:valve-open
           - entity: sensor.hp_temp_sensors_2036e1_tank_2_4
-            name: T_Tank — Puffer 1/2 (FF-Warm)
+            name: Tank (FF-Warm)
             icon: mdi:thermometer-chevron-up
           - entity: sensor.hp_temp_sensors_2036e1_heizung_rl
-            name: T_RL — Heizkreis-Rücklauf (FF-Kalt)
+            name: RL (FF-Kalt)
             icon: mdi:thermometer-chevron-down
-          # — Steuerung & Tuning —
           - entity: input_boolean.hp_mixer_ff
             name: Feedforward aktiv
             icon: mdi:function-variant
@@ -243,11 +241,24 @@ views:
             name: Trim-Limit (±%)
             mode: slider
           - entity: input_number.hp_mixer_dt_min
-            name: FF min. ΔT (Tank−RL)
+            name: FF Nenner-UG ΔT
             mode: slider
-          # — Setup (selten ändern) —
           - entity: input_number.hp_mixer_interval_s
             name: Regelzyklus
+            mode: slider
+          - type: section
+            label: Ventil-Kalibrierung (FOPDT-Stufentest)
+          - entity: input_boolean.hp_mixer_calibration_run
+            name: Kalibrierung starten
+            icon: mdi:play-box-outline
+          - entity: input_text.hp_mixer_calibration_step
+            name: Aktuelle Stufe
+            icon: mdi:stairs
+          - entity: input_text.hp_mixer_calibration_steps
+            name: Stufenliste (%)
+            icon: mdi:format-list-numbered
+          - entity: input_number.hp_mixer_calibration_hold_min
+            name: Haltezeit je Stufe
             mode: slider
           - type: section
             label: Hydrobox & Druck
@@ -383,11 +394,11 @@ views:
             name: Energiezustand (Register 40010)
             icon: mdi:lightning-bolt-circle
           - entity: input_number.hp_boost_pv_min_w
-            name: "AN: PV mindestens"
+            name: 'AN: PV mindestens'
             mode: slider
             icon: mdi:solar-power
           - entity: input_number.hp_boost_pv_off_w
-            name: "AUS: PV unter"
+            name: 'AUS: PV unter'
             mode: slider
             icon: mdi:solar-power-variant-outline
           - type: custom:template-entity-row

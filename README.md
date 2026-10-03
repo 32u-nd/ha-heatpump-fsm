@@ -15,7 +15,8 @@ LG ThermaV Wärmepumpe über Modbus TCP in Home Assistant. Läuft als AppDaemon-
 - **Puffer-Entladung** — Haus heizen ohne Verdichter, solange Puffer warm genug
 - **PV-Überschussladung** — Pufferspeicher mit Photovoltaik-Überschuss laden (40002=1 Einlass-Regelung)
 - **Heizstab-Boost** — bei hohem PV-Überschuss Puffer auf 55 °C laden (inkl. Heizstab)
-- **Warmwasservorrang** — konfigurierbare Zeitfenster (Werktag / Wochenende)
+- **Warmwasservorrang** — konfigurierbare Zeitfenster (Werktag / Wochenende), tritt nur ein wenn der Puffer oben die WW-Reserve unterschreitet
+- **Silent Mode** — pauschal aktiv, Ausnahmen für Pufferladung und ein Erholungsfenster nach dem Abtauen
 - **Verdichterschutz** — Mindestlaufzeit, Ramp-Down, Takt-Schutz
 - **Sicherheitsmechanismen** — E-Stop, Dry-Run-Simulation, Sensor-Fallbacks
 
@@ -97,9 +98,17 @@ AT kalt, Puffer warm:   idle → buffer_drain → heating → buffer_drain → .
 AT kalt, Puffer kalt:   idle → heating → ...
 Komp. intern gestoppt:  heating → buffer_drain (Puffer warm) → heating (Puffer kalt)
 Puffer 1/2 voll:        heating → heating_forced / standby
-WW-Fenster:             (beliebig) → hot_water → standby
+WW-Fenster + Puffer oben knapp:  (beliebig; standby nach Pause) → hot_water → standby
 PV-Überschuss:          idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
+
+**WW-Vorrang ist konditional:** Die FSM wechselt im WW-Fenster nur nach `hot_water`, wenn
+der Puffer oben unter `ww_target + ww_start_margin` fällt — ist er noch warm genug, bleibt
+der aktuelle Zustand (z. B. `heating`) unverändert bestehen, der Heizkreis wird nicht
+unnötig unterbrochen. Fällt der Puffer erst während einer `standby`-Pause unter die
+Schwelle, startet WW nach Ablauf der Pause. Einmal in `hot_water`, bleibt die FSM dort bis
+das Fenster schließt (kein Pendeln). Fühlerausfall liefert `48 °C` → WW-Modus wie bisher
+(sichere Seite).
 
 #### buffer_drain / heating Schwellen (dynamisch)
 
@@ -127,29 +136,44 @@ VL_Soll  = EWMA(VL_roh, α = setpoint_ewma_alpha)          ← Sollwert-Glättun
 - AT (`sensor.aussentemperatur_ema`): exponentiell geglättet, τ = `hp_at_ema_tau_hours` (Default 24 h, einstellbar 1–72 h). Dämpft Takt an der Heizgrenze; bei schwerem Bau τ ≈ 12–24 h empfohlen.
 - AT **Exit** (Heizung/buffer_drain AUS): **EMA ODER AT_1h ≥ Heizgrenze** → Heizung stoppt. Sobald einer der beiden Sensoren warm meldet, ist kein Heizbedarf mehr.
 - AT **Entry** (Heizung/buffer_drain EIN): **EMA UND AT_1h < Heizgrenze** (beide müssen kalt sein). Verhindert Einschalten wenn sich die Sensoren widersprechen (z. B. EMA noch kalt, 1h schon warm → Tendenz steigend).
-- PV: bereits ein 15-min-Mittelwert — kein zusätzliches EWMA auf PV nötig.
-- **Sollwert-EWMA** (α = 0,1, Zeitkonstante ≈ 45 s): der fertige Sollwert wird gedämpft bevor er in PI-Regler und 40006 geht. Schwellen-Berechnungen nutzen den Roh-Sollwert (keine Glättungsverzögerung bei Zustandswechseln).
+- PV-Korrektur: zusätzlich zeitbasiert geglättet (τ = `pv_smooth_minutes`, Default 60 min) — Wolkendurchzüge liessen den Kreis-2-Sollwert sonst um bis zu ~1 K schwanken und den Mischer unnötig fahren.
+- **Sollwert-EWMA** (zeitbasiert, τ = `setpoint_tau_s`, Default 45 s): der fertige Sollwert wird gedämpft bevor er in PI-Regler und 40006 geht. Zeitbasiert statt „Alpha pro Aufruf", da die Aufrufhäufigkeit (Mischer alle 5 s, dazu Sensor-Events) sonst die Zeitkonstante verändern würde. Schwellen-Berechnungen nutzen den Roh-Sollwert (keine Glättungsverzögerung bei Zustandswechseln).
 
 #### Mischer: Feedforward + PI-Trim
 
 ```
-FF   = 100 × (VL_Soll − T_RL) / (T_Tank − T_RL)      ← invertierte Mischgleichung
-       (T_Tank − T_RL) < dt_min → FF = 100 % bzw. 0 %  (Soll ohnehin nicht erreichbar)
-       Ratio → Ventilposition über gemessene Ventilkennlinie (_VALVE_CAL)
+FF   = 100 × (VL_Soll − T_RL) / max(T_Tank − T_RL, dt_min, 0.1)   ← invertierte Mischgleichung
+       dt_min nur als Regularisierung im Nenner — stetig über den ganzen Bereich,
+       kein Sprung bei kleinem ΔT (früher: Fahrt 50→100→50 bei jedem Tank-Tiefpunkt)
 e     = VL_Soll − VL_Ist
-trim  = clamp(kp × e + trim_i, −trim_limit, +trim_limit)   ← langsamer PI auf das Residuum
-pos   = clamp(FF + trim, 0, 100) %, danach Step-Limit (±max_step) auf die alte Position
+e_eff = 0 innerhalb ±mixer_error_db_c, sonst stetig um db verkürzt   ← Totband Soll-Ist
+trim  = clamp(kp × e_eff + trim_i, −trim_limit, +trim_limit)        ← langsamer PI auf das Residuum
+ideal = clamp(FF + trim, 0, 100) %, Slew-Limit (±max_step) auf die alte Ideal-Stellung
+pos   = ideal, aber Fahrbefehl nur bei |ideal − zuletzt kommandiert| ≥ mixer_move_db_pct
+        UND seit letztem Befehl ≥ mixer_min_move_s (Ausnahme: Abweichung ≥ mixer_big_move_pct
+        oder Endanschlag 0/100 %)                                   ← Ausgabe-Gating
 ```
 
-Die Feedforward-Stufe rechnet aus den aktuellen Temperaturen (Puffer-Mitte `T_Tank`,
-Heizkreis-Rücklauf `T_RL`) direkt die nötige Ventilstellung — kompensiert Verstärkungs-Spreizung
-über ΔT und RL-Rezirkulation, bevor der Regler überhaupt eingreifen muss. Der PI-Trim
-(`kp`/`ki`) korrigiert nur noch das Residuum und ist per Anti-Windup gegen Sättigung
-geschützt. Ein Toggle (`input_boolean.hp_mixer_ff`) erlaubt A/B-Tests: aus → reiner Trim-Regler
-auf den vollen Fehler. Bumpless-Init setzt den Trim-Integrator beim ersten Zyklus so, dass
-FF + Trim der realen Ist-Position entspricht (kein Sprung).
-Cover-Befehl nur bei Änderung des ganzzahligen Werts (Sub-1%-Akkumulation).
-Step-Limit ≈ 4 % (= 100 % / Stellantrieb-Laufzeit × Regelzyklus).
+Die Feedforward-Stufe rechnet aus den (tiefpassgefilterten, τ = `mixer_sensor_tau_s`)
+Temperaturen Puffer-Mitte `T_Tank` und Heizkreis-Rücklauf `T_RL` direkt die nötige
+Ventilstellung — kompensiert Verstärkungs-Spreizung über ΔT und RL-Rezirkulation, bevor der
+Regler überhaupt eingreifen muss. Der Sensorfilter dämpft die 0,1-K-Auflösung der Fühler, die
+ohne Filter den FF-Wert bei kleinem Tank-RL-Abstand um ±1 %pt kippen liess. Der PI-Trim
+(`kp`/`ki`) korrigiert nur noch das Residuum ausserhalb des Totbands und ist per Anti-Windup
+gegen Sättigung geschützt. Ein Toggle (`input_boolean.hp_mixer_ff`) erlaubt A/B-Tests: aus →
+reiner Trim-Regler auf den vollen Fehler.
+
+**Mischer-Schonung** (Stellantrieb-Lebensdauer, weniger/größere Fahrten statt 1-%-Pendeln):
+Ausgabe-Gating (oben) plus **Start-Haltezeit** — nach längerem Pumpenstillstand zeigt der
+RL-Fühler für ~3 min veraltete Werte (Rohr noch warm), FF und Trim-Init würden also falsch
+vorbelegt. Die Position wird deshalb `mixer_start_hold_s` (Default 180 s) gehalten; danach
+ist FF der Arbeitspunkt und der Trim startet bei 0 statt die gehaltene Position bumpless
+einzubrennen. Bei kurzer Unterbrechung (< 2 min, Pumpe lief durch, z. B. `buffer_drain` →
+`heating`) bleibt der Trim-Integrator erhalten; sonst bumpless-Init mit auf
+`mixer_trim_init_max_pct` begrenzter Vorbelegung (ein unplausibler FF-Wert beim Start darf
+keinen grossen, stundenlang stehenden Trim-Offset einbrennen — der Integrator ist mit
+T_i ≈ 200 s langsam).
+Step-/Slew-Limit ≈ 4 % (= 100 % / Stellantrieb-Laufzeit × Regelzyklus).
 
 #### PV-Pufferladung (40002=1)
 
@@ -179,6 +203,8 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | `hp_pv_correction_per_kw` | 0,2 °C/kW | VL-Absenkung pro kW PV |
 | `hp_circuit1_offset` | 1 °C | Kreis-1-Aufschlag über Kreis 2 (WP läuft etwas wärmer als Heizkörper-VL) |
 | `hp_at_ema_tau_hours` | 24 h | Zeitkonstante τ der AT-EMA (1–72 h) |
+| `pv_smooth_minutes` | 60 min | PV-Korrektur: Zeitkonstante der Zusatz-Glättung |
+| `setpoint_tau_s` | 45 s | Sollwert-Glättung vor PI-Regler/40006, zeitbasiert |
 
 #### Puffer & Schwellen
 | Parameter | Default | Beschreibung |
@@ -197,6 +223,19 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | `hp_mixer_max_step_pct` | 4 % | Max-Schritt pro Zyklus |
 | `hp_mixer_warmstart_position` | 20 % | Startposition wenn Mischer war zu |
 | `input_boolean.hp_mixer_ff` | AN | Feedforward-Toggle (aus = reiner Trim-Regler, A/B-Test) |
+| `mixer_error_db_c` | 0,5 °C | Totband Soll-Ist für den Trim |
+| `mixer_move_db_pct` | 3 %pt | Fahrbefehl erst ab \|Ideal−Ist\| ≥ x |
+| `mixer_min_move_s` | 60 s | Mindestabstand zwischen zwei Fahrbefehlen |
+| `mixer_big_move_pct` | 10 %pt | Ab dieser Abweichung gilt der Mindestabstand nicht |
+| `mixer_sensor_tau_s` | 60 s | Tiefpass Tank-/RL-Fühler im FF (0 = aus) |
+| `mixer_start_hold_s` | 180 s | Nach Pumpenstart: Position halten (RL-Fühler veraltet) |
+| `mixer_trim_init_max_pct` | 8 %pt | Max. Trim-Vorbelegung beim (bumpless) Start |
+
+#### Warmwasser & Silent Mode
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `ww_start_margin` | 1,0 °C | WW-Modus im WW-Fenster erst wenn Puffer oben < `ww_target` + x |
+| `silent_mode_defrost_hold_h` | 2 h | Nach Abtauende: Silent Mode für diese Dauer deaktiviert (schnellere Erholung) |
 
 #### Verdichterschutz
 | Parameter | Default | Beschreibung |
@@ -228,6 +267,7 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | **Puffer-Gültigkeit** | `_buffer_mid`/`_buffer_bottom` cachen letzten echten Wert. `_buffer_mid_valid()` ist `False` bis nach Neustart der erste Wert eintrifft → `_need_heating`/`_need_buffer_drain` entscheiden nicht auf dem 40 °C-Default, sondern halten den Zustand |
 | **AT EMA Persistenz** | EMA-Wert überlebt HA-Neustarts. `hp_at_ema_value` hat kein `initial:` — HA überschreibt bei gesetztem `initial:` immer den gespeicherten Zustand. Template-Sensor gibt `none` bei unbekanntem Zustand (AT-Fallback greift). Automation: `time_pattern /5min`; Sentinel `ema_prev ≥ 90` initialisiert beim Erst-Deploy |
 | **Mischer Position-Erhalt** | `standby` und `hot_water` frieren Mischerposition ein (kein Fahrbefehl, Position in `_last_pi_position` gesichert). `idle` schließt als einziger Zustand aktiv. PI startet beim nächsten `heating`/`buffer_drain` von gespeicherter Position |
+| **Silent Mode** | Pauschal aktiv, Ausnahme `buffer_charge`/`buffer_charge_boost` (zügiges Laden) und ein `silent_mode_defrost_hold_h`-Fenster nach jedem Abtauende (schnellere Erholung, seltener Folge-Takt). Abgleich zentral in `_do_transition()` nach jedem Zustandswechsel — deckt auch Boost-Austritt ab, nicht nur den Eintritt. Beim AppDaemon-Start Sync mit dem aktuellen Zustand |
 
 ---
 
@@ -275,6 +315,10 @@ dashboard.yaml                  Lovelace-Dashboard (importierbar)
 5. AppDaemon und HA neu starten.
 6. **Erster Test:** `input_boolean.hp_dry_run = EIN` — FSM rechnet, kein Hardware-Write.
    Sensorwerte im Dashboard prüfen, dann Dry-Run deaktivieren.
+7. **Optional — Ventilkennlinie kalibrieren:** `input_boolean.hp_mixer_calibration_run` startet einen
+   FOPDT-Stufentest (Positionen aus `input_text.hp_mixer_calibration_steps`, Haltezeit
+   `input_number.hp_mixer_calibration_hold_min`) zur Ermittlung von `_VALVE_CAL` für die eigene
+   Hydraulik.
 
 ---
 
@@ -296,7 +340,8 @@ heat pump via Modbus TCP in Home Assistant. Runs as an AppDaemon app (Docker).
 - **Buffer drain** — heat the house without the compressor while the buffer is warm enough
 - **PV surplus charging** — charge buffer storage with photovoltaic surplus (Modbus 40002=1 inlet control)
 - **Heating element boost** — charge buffer to 55 °C with high PV surplus (including heating rod)
-- **Domestic hot water priority** — configurable time windows (weekday / weekend)
+- **Domestic hot water priority** — configurable time windows (weekday / weekend), only engages once the buffer top drops below the DHW reserve
+- **Silent mode** — on by default, with exceptions for buffer charging and a recovery window after defrost
 - **Compressor protection** — minimum runtime, ramp-down, cycling protection
 - **Safety mechanisms** — E-Stop, dry-run simulation, sensor fallbacks
 
@@ -378,9 +423,17 @@ OAT cold, buffer warm:      idle → buffer_drain → heating → buffer_drain �
 OAT cold, buffer cold:      idle → heating → ...
 Compressor stops internally: heating → buffer_drain (buffer warm) → heating (buffer cold)
 Buffer 1/2 full:            heating → heating_forced / standby
-DHW window:                 (any state) → hot_water → standby
+DHW window + buffer low:     (any state; standby after pause) → hot_water → standby
 PV surplus:                 idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
+
+**DHW priority is conditional:** during the DHW window the FSM only switches to `hot_water`
+once the buffer top drops below `ww_target + ww_start_margin` — if it's still warm enough,
+the current state (e.g. `heating`) continues unchanged, avoiding an unnecessary interruption
+of the heating circuit. If the buffer only drops below the threshold during a `standby`
+pause, DHW starts once the pause ends. Once in `hot_water`, the FSM stays there until the
+window closes (no cycling back and forth). A sensor failure reads as `48 °C` → DHW mode as
+before (safe side).
 
 #### buffer_drain / heating thresholds (dynamic)
 
@@ -408,29 +461,43 @@ SP_flow  = EWMA(SP_raw, α = setpoint_ewma_alpha)           ← setpoint smoothi
 - OAT **entry** (heating/buffer_drain ON): `sensor.aussentemperatur_ema` — exponentially smoothed, τ = `hp_at_ema_tau_hours` (default 24 h, adjustable 1–72 h). Prevents cycling at the heating threshold; for heavy construction τ ≈ 12–24 h recommended.
 - OAT **exit** (heating/buffer_drain OFF): **EMA OR OAT_1h ≥ threshold** — heating stops as soon as either sensor reads warm.
 - OAT **entry** (heating/buffer_drain ON): **EMA AND OAT_1h < threshold** — both sensors must agree it is cold. Prevents switching on when sensors disagree (e.g. EMA still cold, 1 h already warm → temperature is rising).
-- PV: already a 15-min average — no additional EWMA on PV needed.
-- **Setpoint EWMA** (α = 0.1, time constant ≈ 45 s): final setpoint is smoothed before being sent to PI controller and register 40006. Threshold calculations use the raw setpoint (no lag for state transitions).
+- PV correction: additionally time-smoothed (τ = `pv_smooth_minutes`, default 60 min) — passing clouds otherwise swung the circuit-2 setpoint by up to ~1 K and drove the mixer unnecessarily.
+- **Setpoint EWMA** (time-based, τ = `setpoint_tau_s`, default 45 s): the final setpoint is smoothed before being sent to the PI controller and register 40006. Time-based rather than "alpha per call", since call frequency (mixer every 5 s, plus sensor events) would otherwise change the time constant. Threshold calculations use the raw setpoint (no lag for state transitions).
 
 #### Mixer: Feedforward + PI Trim
 
 ```
-FF   = 100 × (SP_flow − T_return) / (T_tank − T_return)   ← inverted mixing equation
-       (T_tank − T_return) < dt_min → FF = 100 % or 0 %     (setpoint unreachable anyway)
-       ratio → valve position via measured valve characteristic (_VALVE_CAL)
+FF   = 100 × (SP_flow − T_return) / max(T_tank − T_return, dt_min, 0.1)  ← inverted mixing equation
+       dt_min is only a regularization floor in the denominator — continuous across the
+       whole range, no jump at small ΔT (previously: 50→100→50 at every tank dip)
 e     = SP_flow − T_flow_actual
-trim  = clamp(kp × e + trim_i, −trim_limit, +trim_limit)    ← slow PI on the residual
-pos   = clamp(FF + trim, 0, 100) %, then step limit (±max_step) around the previous position
+e_eff = 0 within ±mixer_error_db_c, else continuously shortened by db   ← setpoint/actual dead band
+trim  = clamp(kp × e_eff + trim_i, −trim_limit, +trim_limit)            ← slow PI on the residual
+ideal = clamp(FF + trim, 0, 100) %, slew limit (±max_step) around the previous ideal position
+pos   = ideal, but only commanded if |ideal − last commanded| ≥ mixer_move_db_pct
+        AND ≥ mixer_min_move_s since the last command (exception: deviation ≥
+        mixer_big_move_pct, or hitting the 0/100 % end stop)            ← output gating
 ```
 
-The feedforward stage computes the required valve position directly from current
-temperatures (buffer mid `T_tank`, heating-circuit return `T_return`) — compensating gain
-spread across ΔT and return-line recirculation before the controller has to act at all. The
-PI trim (`kp`/`ki`) only corrects the residual and is anti-windup protected against
-saturation. A toggle (`input_boolean.hp_mixer_ff`) enables A/B testing: off → plain trim
-controller on the full error. Bumpless init sets the trim integrator on the first cycle so
-FF + trim matches the real actual position (no jump).
-Cover command only on integer position change (sub-1% accumulation in float).
-Step limit ≈ 4 % (= 100 % / actuator travel time × control cycle).
+The feedforward stage computes the required valve position directly from the (low-pass
+filtered, τ = `mixer_sensor_tau_s`) temperatures buffer mid `T_tank` and heating-circuit
+return `T_return` — compensating gain spread across ΔT and return-line recirculation before
+the controller has to act at all. The sensor filter damps the sensors' 0.1 K resolution,
+which without filtering tipped the FF value by ±1 %pt at small tank/return gaps. The PI trim
+(`kp`/`ki`) only corrects the residual outside the dead band and is anti-windup protected
+against saturation. A toggle (`input_boolean.hp_mixer_ff`) enables A/B testing: off → plain
+trim controller on the full error.
+
+**Actuator protection** (valve lifetime, fewer/larger moves instead of 1% hunting):
+output gating (above) plus a **start-hold period** — after an extended pump stop the return
+sensor reads stale values for ~3 min (pipe still warm), which would mis-seed FF and the trim
+init. The position is therefore held for `mixer_start_hold_s` (default 180 s); afterward FF
+becomes the operating point and the trim starts at 0 instead of baking the held position in
+bumplessly. On a short interruption (< 2 min, pump kept running, e.g. `buffer_drain` →
+`heating`) the trim integrator is kept; otherwise bumpless init with the pre-load capped at
+`mixer_trim_init_max_pct` (an implausible FF value at start must not bake in a large trim
+offset that then sits for hours — the integrator is slow, T_i ≈ 200 s).
+Step/slew limit ≈ 4 % (= 100 % / actuator travel time × control cycle).
 
 #### PV Buffer Charging (40002=1)
 
@@ -456,6 +523,8 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | `hp_pv_correction_per_kw` | 0.2 °C/kW | Supply setpoint reduction per kW PV |
 | `hp_circuit1_offset` | 1 °C | Circuit 1 offset above circuit 2 (HP runs slightly warmer than radiator supply) |
 | `hp_at_ema_tau_hours` | 24 h | OAT EMA time constant τ (1–72 h) |
+| `pv_smooth_minutes` | 60 min | PV correction: additional smoothing time constant |
+| `setpoint_tau_s` | 45 s | Setpoint smoothing before PI controller/40006, time-based |
 
 #### Buffer & thresholds
 | Parameter | Default | Description |
@@ -474,6 +543,19 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | `hp_mixer_max_step_pct` | 4 % | Max step per cycle |
 | `hp_mixer_warmstart_position` | 20 % | Start position when mixer was closed |
 | `input_boolean.hp_mixer_ff` | ON | Feedforward toggle (off = plain trim controller, A/B test) |
+| `mixer_error_db_c` | 0.5 °C | Setpoint/actual dead band for the trim |
+| `mixer_move_db_pct` | 3 %pt | Only move once \|ideal−actual\| ≥ x |
+| `mixer_min_move_s` | 60 s | Minimum gap between two move commands |
+| `mixer_big_move_pct` | 10 %pt | Above this deviation the minimum gap no longer applies |
+| `mixer_sensor_tau_s` | 60 s | Low-pass on tank/return sensors in FF (0 = off) |
+| `mixer_start_hold_s` | 180 s | After pump start: hold position (return sensor stale) |
+| `mixer_trim_init_max_pct` | 8 %pt | Max. trim pre-load on (bumpless) start |
+
+#### DHW & silent mode
+| Parameter | Default | Description |
+|---|---|---|
+| `ww_start_margin` | 1.0 °C | DHW mode in the DHW window only once buffer top < `ww_target` + x |
+| `silent_mode_defrost_hold_h` | 2 h | Silent mode disabled for this long after defrost ends |
 
 #### Compressor protection
 | Parameter | Default | Description |
@@ -504,6 +586,7 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | **Buffer validity** | `_buffer_mid`/`_buffer_bottom` cache the last real value. `_buffer_mid_valid()` is `False` until the first reading arrives after restart → `_need_heating`/`_need_buffer_drain` do not decide on the 40 °C default but hold the current state |
 | **OAT EMA persistence** | EMA survives HA restarts. `hp_at_ema_value` has no `initial:` — HA always overrides restored state when `initial:` is set in YAML. Template sensor returns `none` when unknown (OAT fallback 30 °C applies). Automation: `time_pattern /5min`; sentinel `ema_prev ≥ 90` initialises on first deploy |
 | **Mixer position retention** | `standby` and `hot_water` freeze the mixer position (no travel command, position saved in `_last_pi_position`). `idle` is the only state that actively closes the mixer. PI resumes from the saved position on next `heating`/`buffer_drain` |
+| **Silent mode** | On by default, except `buffer_charge`/`buffer_charge_boost` (fast charging) and a `silent_mode_defrost_hold_h` window after each defrost ends (faster recovery, fewer follow-up cycles). Reconciled centrally in `_do_transition()` after every state change — also covers boost exit, not just entry. Synced with the current state on AppDaemon start |
 
 ---
 
@@ -551,6 +634,9 @@ dashboard.yaml                  Lovelace dashboard (importable)
 5. Restart AppDaemon and Home Assistant.
 6. **First test:** Set `input_boolean.hp_dry_run = ON` — FSM runs, no hardware writes.
    Verify sensor values in the dashboard, then deactivate dry-run.
+7. **Optional — calibrate the valve characteristic:** `input_boolean.hp_mixer_calibration_run`
+   starts a FOPDT step test (positions from `input_text.hp_mixer_calibration_steps`, hold time
+   `input_number.hp_mixer_calibration_hold_min`) to determine `_VALVE_CAL` for your own hydraulics.
 
 ---
 

@@ -488,25 +488,23 @@ fsm_heatpump:
           unique_id: fsm_sensor_mischer_ist_position
           unit_of_measurement: "%"
           icon: mdi:valve
+          # Kein int(0)-Default: nach HA-Neustart (Backup ~02:05) fehlt das Attribut kurz,
+          # das Dashboard zeigte dann eine Schein-0 %. Jetzt "nicht verfuegbar" (Luecke).
+          availability: >
+            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') is not none }}
           state: >
-            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') | int(0) }}
+            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') | int }}
 
         - name: "Heizkurve Sollwert Kreis 2"
           unique_id: fsm_sensor_sollwert_kreis2
           unit_of_measurement: "°C"
           icon: mdi:thermometer-water
           state_class: measurement
+          # Der von der FSM angewendete Sollwert (inkl. geglaetteter PV-Korrektur,
+          # siehe _pv_kw_smoothed) - nicht mehr eine eigene Nachrechnung mit
+          # ungeglaetteter PV, die vom echten Sollwert abwich.
           state: >
-            {% set at_high = states('input_number.hp_heat_curve_at_high') | float(16) %}
-            {% set vl_high = states('input_number.hp_heat_curve_vl_high') | float(27) %}
-            {% set at_low  = states('input_number.hp_heat_curve_at_low')  | float(-15) %}
-            {% set vl_low  = states('input_number.hp_heat_curve_vl_low')  | float(40) %}
-            {% set at      = states('sensor.aussentemperatur_ema') | float(10) %}
-            {% set pv_kw   = states('sensor.pv_produktion_15m') | float(0) / 1000 %}
-            {% set corr    = states('input_number.hp_pv_correction_per_kw') | float(0.2) %}
-            {% set slope   = (vl_low - vl_high) / (at_high - at_low) %}
-            {% set base    = vl_high + (at_high - at) * slope %}
-            {{ [18.0, [60.0, (base - pv_kw * corr)] | min] | max | round(1) }}
+            {{ states('input_number.thermav_40006') | float(0) | round(1) }}
 
         - name: "Heizkurve Sollwert Kreis 1"
           unique_id: fsm_sensor_sollwert_kreis1

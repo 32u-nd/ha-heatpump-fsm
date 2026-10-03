@@ -82,6 +82,9 @@ ZUSTAENDE
                          Neustart-Restore: Timer sofort abgelaufen (_forced_end_time = now())
 
   hot_water           -> Warmwasser-Vorrang, WP EIN (WW-Modus), Pumpe AUS
+                         Einstieg: WW-Fenster aktiv UND Puffer oben < ww_target + ww_start_margin
+                                   (Puffer oben warm genug -> Zustand bleibt, kein WW-Modus)
+                         Austritt: WW-Fenster schliesst -> standby (kein Rueckwechsel im Fenster)
 
   buffer_charge       -> PV-Ueberschuss laedt Puffer, WP EIN, 40002=1 (Einlass-Regelung)
                          Pumpe/Mischer: AT-abhaengig via _update_charge_heating
@@ -119,7 +122,8 @@ ZUSTANDSUEBERGAENGE (vereinfacht)
                                                                    │
   Puffer 1/2 voll:         heating -----------------------------> heating_forced / standby
   Komp. intern gestoppt:   heating -----------------------------> buffer_drain (wenn Puffer warm genug)
-  WW-Fenster:              (jeder Zustand) ----------------------> hot_water
+  WW-Fenster + Puffer oben < ww_target + ww_start_margin:
+                           (jeder Zustand; standby nach Pause) -> hot_water
   PV-Ueberschuss:           idle / standby / buffer_drain --------> buffer_charge
 
   buffer_drain -> idle:
@@ -157,6 +161,7 @@ DRY-RUN MODUS (Simulation)
 from fsm_base import FSMBase, Transition
 import collections
 import datetime
+import math
 import os
 
 
@@ -172,6 +177,9 @@ class HeatpumpFSM(FSMBase):
         "buffer_drain_margin": 3.0,
         "buffer_drain_hyst": 2.0,
         "ww_target_temp": 51.0,
+        # WW-Modus im WW-Fenster erst wenn Puffer oben < ww_target + x faellt.
+        # Darueber bleibt der aktuelle Zustand (z.B. heating) erhalten.
+        "ww_start_margin": 1.0,
         "pv_buffer_min_kwh": 5.0,
         "hw_morning_weekday_h": 5,
         "hw_morning_weekday_m": 30,
@@ -187,8 +195,17 @@ class HeatpumpFSM(FSMBase):
         "mixer_interval_s": 5.0,
         "mixer_max_step_pct": 4.0,
         "mixer_warmstart_position": 20.0,
-        "mixer_dt_min": 6.0,            # min. (T_Tank-T_RL) bevor FF rechnet (sonst voll auf)
+        "mixer_dt_min": 2.0,            # Untergrenze (T_Tank-T_RL) im FF-Nenner (kein Sprung, nur Regularisierung)
         "mixer_trim_limit_pct": 15.0,  # max. |Trim| um den FF-Arbeitspunkt
+        # Mischer-Schonung (Stellantrieb-Lebensdauer): weniger, groessere Fahrten
+        "mixer_error_db_c": 0.5,        # Totband Soll-Ist Kreis 2 fuer den Trim [°C]
+        "mixer_move_db_pct": 3.0,       # Fahrbefehl erst ab |Ideal-Ist| >= x %pt
+        "mixer_min_move_s": 60.0,       # Mindestabstand zwischen zwei Fahrbefehlen [s]
+        "mixer_big_move_pct": 10.0,     # ab dieser Abweichung gilt der Mindestabstand nicht
+        "mixer_sensor_tau_s": 60.0,     # Tiefpass Tank-/RL-Fuehler im FF (0 = aus) [s]
+        "mixer_start_hold_s": 180.0,    # nach Pumpenstart: so lange Position halten (RL-Fuehler veraltet) [s]
+        "mixer_trim_init_max_pct": 8.0, # max. Trim-Vorbelegung beim (bumpless) Start [%pt]
+        "pv_smooth_minutes": 60.0,      # PV-Korrektur: Zeitkonstante der zusaetzlichen Glaettung [min]
         "min_runtime_minutes": 45.0,
         "standby_minutes": 3.0,
         "forced_setpoint_offset": 1.0,
@@ -213,7 +230,10 @@ class HeatpumpFSM(FSMBase):
         # Verhindert Fehlausstieg durch heisses Rohrrestwasser (Sommer, Grundfos AUS):
         # WP-interne Pumpe startet, liest ~52°C Restwasser -> sofortiger Exit wäre falsch.
         "buffer_charge_min_minutes": 5.0,
-        "setpoint_ewma_alpha": 0.1,
+        "setpoint_tau_s": 45.0,  # Zeitkonstante der Sollwert-Glaettung (zeitbasiert) [s]
+        # Silent Mode: nach Abtauende so lange deaktiviert (volle Leistung fuer
+        # schnellere Erholung, weniger Folge-Takte) [h]
+        "silent_mode_defrost_hold_h": 2.0,
     }
 
     @property
@@ -300,9 +320,10 @@ class HeatpumpFSM(FSMBase):
         self._switch_silent_mode = self.args.get(
             "switch_silent_mode", "switch.silent_mode_10003"
         )
-        self._silent_mode_before_boost: bool | None = (
-            None  # gespeicherter Zustand vor Boost
-        )
+        # Silent Mode ist pauschal aktiv (siehe _desired_silent_mode); dieses Feld
+        # haelt das Ende eines temporaeren "Abtauen-beendet"-Fensters, in dem er
+        # unabhaengig vom Zustand deaktiviert bleibt.
+        self._silent_override_until: datetime.datetime | None = None
 
         # -- Dry-Run -----------------------------------------------------------
         self._dry_run_entity = self.args.get(
@@ -350,6 +371,13 @@ class HeatpumpFSM(FSMBase):
         self._mixer_trim_i = 0.0       # Trim-Integrator (%)
         self._mixer_trim_init = True   # erster Step nach Start: bumpless initialisieren
         self._mixer_handle = None
+        self._mixer_ideal = 0.0        # Ideal-Stellung (Slew-limitiert); _pi_position = zuletzt kommandiert
+        self._mixer_last_cmd_t: datetime.datetime | None = None  # letzter Fahrbefehl
+        self._mixer_stopped_at: datetime.datetime | None = None  # letzter Stopp des Reglers
+        self._mixer_hold_until: datetime.datetime | None = None  # Start-Haltezeit (veralteter RL)
+        self._mixer_tank_f: float | None = None  # tiefpassgefilterter Tank-Fuehler (FF)
+        self._mixer_rl_f: float | None = None    # tiefpassgefilterter RL-Fuehler (FF)
+        self._mixer_filter_t: datetime.datetime | None = None
         self._forced_lp_value = None
         self._decay_start_time = None   # Zeitstempel: Beginn Phase-2-Absenkung
         self._decay_lp_start = None     # LP-Wert beim Start der Absenkung
@@ -364,6 +392,9 @@ class HeatpumpFSM(FSMBase):
             False  # Hysterese: True nach erfolgreicher Pufferladung
         )
         self._setpoint_ewma: float | None = None  # EWMA des fertigen Heizkurven-Sollwerts
+        self._setpoint_ewma_t: datetime.datetime | None = None  # Zeitstempel letzte EWMA-Aktualisierung
+        self._pv_ema_kw: float | None = None  # zeitbasierte EMA der PV-Leistung [kW]
+        self._pv_ema_t: datetime.datetime | None = None
         self._last_forced_c1: float | None = (
             None  # Ratchet: nur steigende Werte in Mindestlaufzeit
         )
@@ -686,7 +717,8 @@ class HeatpumpFSM(FSMBase):
 
     def define_transitions(self) -> list[Transition]:
         return [
-            # WW hat Vorrang (aus allen aktiven Zustaenden)
+            # WW hat Vorrang (aus allen aktiven Zustaenden) - aber nur wenn der Puffer
+            # oben die WW-Reserve unterschreitet (siehe _need_hot_water).
             Transition(
                 "idle", "hot_water", self._need_hot_water, label="WW-Fenster geoeffnet"
             ),
@@ -713,6 +745,14 @@ class HeatpumpFSM(FSMBase):
                 "hot_water",
                 self._need_hot_water,
                 label="WW verdraengt Puffer-Entladen",
+            ),
+            # Faellt der Puffer erst waehrend einer Standby-Pause unter die WW-Schwelle
+            # (z.B. heating -> standby im WW-Fenster), nach Ablauf der Pause WW starten.
+            Transition(
+                "standby",
+                "hot_water",
+                lambda: self._standby_done() and self._need_hot_water(),
+                label="Standby vorbei, WW noetig",
             ),
             # WW fertig -> Standby
             Transition(
@@ -941,11 +981,17 @@ class HeatpumpFSM(FSMBase):
 
         self.run_every(self.evaluate_transitions, self.datetime(), 60)
         self.run_every(self._sync_modbus_setpoints, self.datetime(), 60)
+        self.run_every(self._apply_silent_mode, self.datetime(), 60)
         self._schedule_hot_water_windows()
 
         prefix = self.args.get("event_prefix", "fsm_heatpump")
         self.listen_event(self._on_force_event, f"{prefix}_force_state")
         self.listen_state(self._on_compressor_change, self._binary_compressor)
+        if self._binary_defrost:
+            self.listen_state(
+                self._on_defrost_edge, self._binary_defrost, old="on", new="off"
+            )
+        self._apply_silent_mode()  # Start-Sync (z.B. nach AppDaemon-Neustart)
 
     def _schedule_hot_water_windows(self):
         h, m = self._parse_time(self._hw_morning_weekday)
@@ -1018,6 +1064,13 @@ class HeatpumpFSM(FSMBase):
                 self._stop_mixer_controller()
                 self._mixer_full_close()
 
+    def _do_transition(self, t):
+        """Nach jedem Zustandswechsel Silent Mode sofort abgleichen (nicht erst
+        beim naechsten 60s-Tick) - deckt auch den Austritt aus buffer_charge/
+        buffer_charge_boost ab, nicht nur den Eintritt."""
+        super()._do_transition(t)
+        self._apply_silent_mode()
+
     # -------------------------------------------------------------------------
     # State Hooks
     # -------------------------------------------------------------------------
@@ -1083,6 +1136,7 @@ class HeatpumpFSM(FSMBase):
         self._set_wp_mode("buffer_charge", self._buffer_charge_inlet_temp)
         # Grundfos + Mischer: AT-abhaengig (kalt -> parallel heizen, warm -> AUS)
         self._update_charge_heating()
+        self._apply_silent_mode()
         self.log(
             f"[HP] PV-Pufferladung AN | 40002=1 (Einlass-Regelung) | "
             f"Einlass-Soll: {self._buffer_charge_inlet_temp:.1f}C | "
@@ -1111,7 +1165,7 @@ class HeatpumpFSM(FSMBase):
         self._set_wp_mode("buffer_charge", self._boost_inlet_temp)
         # Grundfos + Mischer: AT-abhaengig (kalt -> parallel heizen, warm -> AUS)
         self._update_charge_heating()
-        self._set_silent_mode(False)
+        self._apply_silent_mode()
         self.log(
             f"[HP] Heizstab-Boost AN | Energiezustand={self._boost_energy_state} | "
             f"Einlass-Soll={self._boost_inlet_temp}C | "
@@ -1131,7 +1185,10 @@ class HeatpumpFSM(FSMBase):
             f"[HP] Heizstab-Boost AUS | Puffer 1/4={bottom:.1f}C restart_temp={restart_temp:.1f}C "
             f"→ vollgeladen={'JA' if self._buffer_fully_charged else 'NEIN'}"
         )
-        self._restore_silent_mode()
+        # Zustand ist beim Exit-Hook noch "buffer_charge_boost" (self._state wird
+        # erst danach umgestellt) - _apply_silent_mode() hier wuerde also noch
+        # False liefern. Reconcile erfolgt zentral in _do_transition() nach
+        # dem Hook, sobald self._state auf den neuen Zustand zeigt.
 
     def on_enter_heating_forced(self):
         self._pump_on()
@@ -1238,9 +1295,37 @@ class HeatpumpFSM(FSMBase):
     # -------------------------------------------------------------------------
 
     def _start_mixer_controller(self):
-        self._stop_mixer_controller()
-        # Bumpless: erster Step initialisiert Trim so, dass Gesamtstellung = reale Position
-        self._mixer_trim_init = True
+        if self._mixer_handle is not None:
+            # Regler laeuft bereits (z.B. heating -> heating_forced / buffer_drain):
+            # nahtlos weiter, Trim-Integrator und Fahrhistorie bleiben erhalten.
+            self._mixer_ideal = self._pi_position
+            return
+        now = datetime.datetime.now()
+        self._mixer_ideal = self._pi_position
+        self._mixer_last_cmd_t = None
+        self._mixer_tank_f = self._mixer_rl_f = self._mixer_filter_t = None
+        # Nach laengerem Stillstand (Pumpe war aus) zeigt der RL-Fuehler veraltete Werte
+        # (Rohr warm, bis kaltes Heizkreiswasser ankommt, ~3 min). Feedforward und Trim-Init
+        # wuerden damit falsch vorbelegt -> Position halten, bis der Fuehler wieder stimmt.
+        stopped_s = (
+            None
+            if self._mixer_stopped_at is None
+            else (now - self._mixer_stopped_at).total_seconds()
+        )
+        # Kurze Unterbrechung (z.B. buffer_drain -> heating, Pumpe lief durch): Trim-Integrator
+        # behalten. Sonst bumpless: erster (nicht gehaltener) Step initialisiert den Trim so,
+        # dass Gesamtstellung = reale Position.
+        self._mixer_trim_init = not (stopped_s is not None and stopped_s < 120.0)
+        hold_s = self._get_param("mixer_start_hold_s")
+        if hold_s > 0.0 and (stopped_s is None or stopped_s >= 120.0):
+            self._mixer_hold_until = now + datetime.timedelta(seconds=hold_s)
+            self.log(
+                f"[Mischer] Start: Position {self._pi_position:.0f}% fuer {hold_s:.0f}s halten "
+                f"(RL-Fuehler nach Pumpenstillstand veraltet)",
+                level="DEBUG",
+            )
+        else:
+            self._mixer_hold_until = None
         self._mixer_handle = self.run_every(
             self._mixer_pi_step, self.datetime(), self._mixer_interval_s
         )
@@ -1252,6 +1337,29 @@ class HeatpumpFSM(FSMBase):
             except Exception:
                 pass
             self._mixer_handle = None
+            self._mixer_stopped_at = datetime.datetime.now()
+
+    def _mixer_filter_sensors(self, t_tank: float, t_rl: float) -> tuple[float, float]:
+        """Zeitbasierter Tiefpass (tau = mixer_sensor_tau_s) fuer die FF-Eingaenge.
+        Tank/RL haben 0.1-K-Aufloesung; ohne Filter kippt der FF-Wert (besonders bei
+        kleinem Tank-RL-Abstand) um ±1 %pt und der Mischer pendelt."""
+        now = datetime.datetime.now()
+        tau = self._get_param("mixer_sensor_tau_s")
+        if (
+            self._mixer_tank_f is None
+            or self._mixer_rl_f is None
+            or self._mixer_filter_t is None
+            or tau <= 0.0
+        ):
+            self._mixer_tank_f, self._mixer_rl_f = t_tank, t_rl
+        else:
+            dt = (now - self._mixer_filter_t).total_seconds()
+            if dt > 0.0:
+                a = 1.0 - math.exp(-dt / tau)
+                self._mixer_tank_f += a * (t_tank - self._mixer_tank_f)
+                self._mixer_rl_f += a * (t_rl - self._mixer_rl_f)
+        self._mixer_filter_t = now
+        return self._mixer_tank_f, self._mixer_rl_f
 
     def _mixer_pi_step(self, kwargs):
         if self.state not in (
@@ -1278,64 +1386,126 @@ class HeatpumpFSM(FSMBase):
         setpoint = self._calc_flow_setpoint_smoothed()
         actual = self._flow_temp()
         e = setpoint - actual
+        # Totband Soll-Ist (Kreis 2): innerhalb ±db kein Trim-Eingriff, ausserhalb
+        # stetig um db verkuerzt (kein Sprung an der Bandgrenze).
+        e_db = self._get_param("mixer_error_db_c")
+        e_eff = 0.0 if abs(e) <= e_db else e - math.copysign(e_db, e)
         kp = self._mixer_kp
         ki = self._mixer_ki
         limit = self._get_param("mixer_trim_limit_pct")
 
         # --- Feedforward: invertierte Mischgleichung -------------------------
-        # VL = x*T_Tank + (1-x)*T_RL  ->  u_ff[%] = 100*(VL_Soll - T_RL)/(T_Tank - T_RL)
+        # VL = x*T_Tank + (1-x)*T_RL  ->  x = (VL_Soll - T_RL)/(T_Tank - T_RL)
         # Nutzt aktuelle Messwerte -> kompensiert Verstaerkungs-Spreizung (ueber dT)
         # und die RL-Rezirkulation direkt. Bei ungueltigen Fuehlern: letzten FF-Wert halten.
+        # Stetig ueber den ganzen Bereich: dT wird nur im Nenner nach unten auf
+        # mixer_dt_min begrenzt (Regularisierung). Frueher sprang der FF bei
+        # dT < dt_min hart auf 100 % -> Fahrt 50 -> 100 -> 50 bei jedem Tank-Tiefpunkt.
         t_tank = self._sensor_value_or_none(
             self._sensor_buffer_mid, "_buffer_mid_cache"
         )
         t_rl = self._mixer_return_temp()
         ff_base = self._mixer_ff_base
-        if self._mixer_ff_enabled() and t_tank is not None and t_rl is not None:
-            dt = t_tank - t_rl
-            dt_min = self._get_param("mixer_dt_min")
-            if dt < dt_min:
-                # Tank kaum waermer als RL -> Soll nicht erreichbar: voll auf (warm) bzw. zu
-                ff_base = 100.0 if (setpoint - t_rl) > 0 else 0.0
-            else:
-                ratio = max(0.0, min(100.0, 100.0 * (setpoint - t_rl) / dt))
+        if t_tank is not None and t_rl is not None:
+            t_tank, t_rl = self._mixer_filter_sensors(t_tank, t_rl)
+            if self._mixer_ff_enabled():
+                dt = t_tank - t_rl
+                dt_min = self._get_param("mixer_dt_min")
+                ratio = max(
+                    0.0,
+                    min(100.0, 100.0 * (setpoint - t_rl) / max(dt, dt_min, 0.1)),
+                )
                 # Ratio (physikalisches Mischverhaeltnis) -> noetige Stellposition
                 # ueber die gemessene Ventilkennlinie (siehe _VALVE_CAL).
                 ff_base = self._valve_position_for_ratio(ratio)
         self._mixer_ff_base = ff_base
 
+        # --- Start-Haltezeit: RL-Fuehler noch veraltet -> nicht fahren, nicht init. ---
+        if self._mixer_hold_until is not None:
+            if datetime.datetime.now() < self._mixer_hold_until:
+                self.log(
+                    f"[Mischer] Halten bis {self._mixer_hold_until.strftime('%H:%M:%S')} | "
+                    f"Soll={setpoint:.1f}C Ist={actual:.1f}C FF={ff_base:.1f}%",
+                    level="DEBUG",
+                )
+                return
+            # Haltezeit vorbei: FF ist jetzt der Arbeitspunkt, Trim startet bei 0. Die
+            # gehaltene Position (Warmstart/alte Stellung) sagt nichts ueber den Trim aus:
+            # bumpless-Init brannte sonst 5-8 %pt Offset ein (Log 25./26.09.: -5.4, +4.8, -8.0),
+            # den das Totband stundenlang stehen liess. Der Sprung zum FF laeuft ueber Slew/Gating.
+            self._mixer_hold_until = None
+            self._mixer_trim_i = 0.0
+            self._mixer_trim_init = False
+
         # --- Bumpless-Init: Trim so, dass Gesamtstellung = reale Position ----
+        # Vorbelegung auf mixer_trim_init_max_pct begrenzt: ein unplausibler FF-Wert
+        # beim Start darf keinen grossen Trim-Offset einbrennen (Integrator ist langsam,
+        # T_i ~ 200 s bei kleinem e -> ein falscher Offset haelt Stunden).
         if self._mixer_trim_init:
+            init_lim = min(limit, self._get_param("mixer_trim_init_max_pct"))
             self._mixer_trim_i = max(
-                -limit, min(limit, self._pi_position - ff_base - kp * e)
+                -init_lim, min(init_lim, self._pi_position - ff_base - kp * e_eff)
             )
             self._mixer_trim_init = False
 
         # --- Langsamer PI-Trim auf das Residuum ------------------------------
-        total_unclamped = ff_base + kp * e + self._mixer_trim_i + ki * e
+        total_unclamped = ff_base + kp * e_eff + self._mixer_trim_i + ki * e_eff
         # Anti-Windup: nur integrieren wenn Ausgang nicht in Fehlerrichtung saturiert
         if (
             0.0 < total_unclamped < 100.0
-            or (total_unclamped <= 0.0 and e > 0)
-            or (total_unclamped >= 100.0 and e < 0)
+            or (total_unclamped <= 0.0 and e_eff > 0)
+            or (total_unclamped >= 100.0 and e_eff < 0)
         ):
-            self._mixer_trim_i = max(-limit, min(limit, self._mixer_trim_i + ki * e))
-        trim = max(-limit, min(limit, kp * e + self._mixer_trim_i))
+            self._mixer_trim_i = max(
+                -limit, min(limit, self._mixer_trim_i + ki * e_eff)
+            )
+        trim = max(-limit, min(limit, kp * e_eff + self._mixer_trim_i))
 
-        # --- Slew-Limit (Stellantrieb 123s Vollhub) + Clamp ------------------
+        # --- Slew-Limit (Stellantrieb 123s Vollhub) + Clamp -> Ideal-Stellung -----
         u_raw = max(0.0, min(100.0, ff_base + trim))
         max_step = self._get_param("mixer_max_step_pct")
+        ideal = max(
+            0.0,
+            min(
+                100.0,
+                self._mixer_ideal + max(-max_step, min(max_step, u_raw - self._mixer_ideal)),
+            ),
+        )
+        self._mixer_ideal = ideal
+
+        # --- Ausgabe-Gating: wenige, groessere Fahrten statt 1-%-Pendeln ------------
+        # Fahrbefehl nur wenn |Ideal - zuletzt kommandiert| >= mixer_move_db_pct UND
+        # seit dem letzten Fahrbefehl mixer_min_move_s vergangen sind. Grosse
+        # Abweichungen (>= mixer_big_move_pct) duerfen den Mindestabstand umgehen;
+        # Endanschlaege (0/100 %) werden auch unterhalb des Totbands angefahren.
         old_pos = self._pi_position
-        delta = max(-max_step, min(max_step, u_raw - old_pos))
-        new_pos = max(0.0, min(100.0, old_pos + delta))
-        self._pi_position = new_pos
+        now = datetime.datetime.now()
+        since = (
+            float("inf")
+            if self._mixer_last_cmd_t is None
+            else (now - self._mixer_last_cmd_t).total_seconds()
+        )
+        diff = ideal - old_pos
+        move_db = self._get_param("mixer_move_db_pct")
+        min_gap = self._get_param("mixer_min_move_s")
+        big = self._get_param("mixer_big_move_pct")
+        at_stop = (ideal <= 0.5 and old_pos > 0.5) or (ideal >= 99.5 and old_pos < 99.5)
+        move = (
+            round(ideal) != round(old_pos)
+            and (abs(diff) >= move_db or at_stop)
+            and (abs(diff) >= big or since >= min_gap)
+        )
+        new_pos = ideal if move else old_pos
         self.log(
-            f"[Mischer] Soll={setpoint:.1f}C Ist={actual:.1f}C e={e:+.1f}C | "
+            f"[Mischer] Soll={setpoint:.1f}C Ist={actual:.1f}C e={e:+.1f}C(eff {e_eff:+.1f}) | "
             f"FF={ff_base:.1f}% Trim={trim:+.1f}%(I={self._mixer_trim_i:+.1f}) | "
-            f"Pos: {old_pos:.1f}%->{new_pos:.1f}%",
+            f"Ideal={ideal:.1f}% Pos: {old_pos:.1f}%->{new_pos:.1f}%"
+            f"{'' if move else ' (gehalten)'}",
             level="DEBUG",
         )
-        if round(new_pos) != round(old_pos):
+        if move:
+            self._pi_position = new_pos
+            self._mixer_last_cmd_t = now
             self._set_cover_position(new_pos)
             self._write_pi_position(new_pos)
 
@@ -1525,6 +1695,12 @@ class HeatpumpFSM(FSMBase):
         elif state == "hot_water":
             msg += f" | WW-Fenster={'aktiv' if self._hw_window_active else 'inaktiv'}"
 
+        if self._hw_window_active and state != "hot_water":
+            msg += (
+                f" | WW-Fenster aktiv, Oben={self._buffer_top():.1f}C"
+                f"(WW-Modus<{self._ww_start_threshold():.1f})"
+            )
+
         self.log(msg)
 
     # -------------------------------------------------------------------------
@@ -1583,8 +1759,18 @@ class HeatpumpFSM(FSMBase):
             and self._buffer_mid() < threshold
         )
 
+    def _ww_start_threshold(self) -> float:
+        """Puffer oben unter diesem Wert -> WW-Modus im WW-Fenster."""
+        return self._ww_target + self._get_param("ww_start_margin")
+
     def _need_hot_water(self) -> bool:
-        return self._hw_window_active
+        """WW-Vorrang nur wenn im WW-Fenster der Puffer oben nicht mehr genug Reserve hat.
+        Solange Puffer oben >= ww_target + ww_start_margin, bleibt der aktuelle Zustand
+        (z.B. heating laeuft weiter, Heizkreis geht nicht kurzzeitig aus).
+        Einmal in hot_water bleibt die FSM dort bis das Fenster schliesst (kein Pendeln).
+        Fuehlerausfall: _buffer_top() liefert 48°C -> WW-Modus wie bisher (sichere Seite).
+        """
+        return self._hw_window_active and self._buffer_top() < self._ww_start_threshold()
 
     def _need_buffer_drain(self) -> bool:
         """Puffer hat noch genug Waerme, AT kalt - Pumpe liefert Pufferwaerme ans Haus.
@@ -1715,9 +1901,30 @@ class HeatpumpFSM(FSMBase):
     # Heizkurve
     # -------------------------------------------------------------------------
 
+    def _pv_kw_smoothed(self) -> float:
+        """PV-Leistung [kW] mit zusaetzlicher zeitbasierter EMA (tau = pv_smooth_minutes).
+
+        sensor.pv_produktion_15m ist bereits ein 15-min-Mittelwert; Wolkendurchzuege
+        liessen den Kreis-2-Sollwert (PV-Korrektur) trotzdem um bis zu ~1 K schwanken
+        und damit den Mischer fahren. Die EMA ist zeitbasiert (alpha = 1-exp(-dt/tau)),
+        also unabhaengig davon, wie oft sie aufgerufen wird. Start/Neustart: aktueller Wert.
+        """
+        now = datetime.datetime.now()
+        pv_kw = self._pv_power_w() / 1000.0
+        tau_s = max(0.0, self._get_param("pv_smooth_minutes")) * 60.0
+        if self._pv_ema_kw is None or self._pv_ema_t is None or tau_s <= 0.0:
+            self._pv_ema_kw = pv_kw
+        else:
+            dt = (now - self._pv_ema_t).total_seconds()
+            if dt > 0.0:
+                self._pv_ema_kw += (1.0 - math.exp(-dt / tau_s)) * (pv_kw - self._pv_ema_kw)
+        self._pv_ema_t = now
+        return self._pv_ema_kw
+
     def _calc_flow_setpoint(self, with_pv_correction: bool = True) -> float:
-        """Momentaner (ungedaempfter) Heizkurven-Sollwert.
-        Wird fuer Schwellen-Berechnungen (buffer_drain) genutzt - kein EWMA, instant response."""
+        """Heizkurven-Sollwert (ohne Sollwert-EWMA). Die PV-Korrektur nutzt die
+        geglaettete PV-Leistung (_pv_kw_smoothed). Schwellen-Berechnungen (buffer_drain)
+        rufen ohne PV-Korrektur auf - instant response auf AT/Parameter."""
         at_high = self._get_param("heat_curve_at_high")
         vl_high = self._get_param("heat_curve_vl_high")
         at_low = self._get_param("heat_curve_at_low")
@@ -1726,20 +1933,26 @@ class HeatpumpFSM(FSMBase):
         slope = (vl_low - vl_high) / (at_high - at_low)
         base = vl_high + (at_high - at) * slope
         if with_pv_correction:
-            pv_kw = self._pv_power_w() / 1000.0
-            base -= pv_kw * self._pv_correction_per_kw
+            base -= self._pv_kw_smoothed() * self._pv_correction_per_kw
         return max(18.0, min(60.0, base))
 
     def _calc_flow_setpoint_smoothed(self) -> float:
-        """EWMA-gedaempfter Sollwert fuer PI-Regler und 40006-Writes.
-        Verhindert sprunghafte Stellbefehle bei AT/PV-Schwankungen.
+        """Gedaempfter Sollwert fuer Mischer-Regler und 40006-Writes (PV-Glaettung
+        siehe _pv_kw_smoothed; hier zusaetzlich ein kurzer zeitbasierter EWMA,
+        tau = setpoint_tau_s, gegen Spruenge bei Parameteraenderungen).
+        Zeitbasiert statt 'alpha pro Aufruf': die Aufrufhaeufigkeit (Mischer 5 s,
+        dazu Sensor-Events) darf die Zeitkonstante nicht veraendern.
         Schwellen-Berechnungen nutzen _calc_flow_setpoint() (ohne Daempfung)."""
         raw = self._calc_flow_setpoint()
-        alpha = self._get_param("setpoint_ewma_alpha")
-        if self._setpoint_ewma is None:
+        now = datetime.datetime.now()
+        tau = self._get_param("setpoint_tau_s")
+        if self._setpoint_ewma is None or self._setpoint_ewma_t is None or tau <= 0.0:
             self._setpoint_ewma = raw
         else:
-            self._setpoint_ewma = alpha * raw + (1.0 - alpha) * self._setpoint_ewma
+            dt = (now - self._setpoint_ewma_t).total_seconds()
+            if dt > 0.0:
+                self._setpoint_ewma += (1.0 - math.exp(-dt / tau)) * (raw - self._setpoint_ewma)
+        self._setpoint_ewma_t = now
         return self._setpoint_ewma
 
     # -------------------------------------------------------------------------
@@ -2020,8 +2233,41 @@ class HeatpumpFSM(FSMBase):
         except Exception as e:
             self.log(f"[HP] Steuermethode setzen fehlgeschlagen: {e}", level="WARNING")
 
+    def _desired_silent_mode(self) -> bool:
+        """Silent Mode ist pauschal aktiv. Ausnahmen (volle Leistung gewuenscht):
+        - buffer_charge/buffer_charge_boost: WP soll Puffer zuegig laden.
+        - Nach Abtauende: fuer silent_mode_defrost_hold_h Stunden aus, damit die
+          WP sich schneller erholt und seltener in den naechsten Abtauzyklus
+          rutscht (im Winter taut sie haeufig ab, dort wirkt das am meisten).
+        """
+        if self._state in ("buffer_charge", "buffer_charge_boost"):
+            return False
+        if self._silent_override_until and datetime.datetime.now() < self._silent_override_until:
+            return False
+        return True
+
+    def _apply_silent_mode(self, kwargs=None):
+        self._set_silent_mode(self._desired_silent_mode())
+
+    def _on_defrost_edge(self, entity, attribute, old, new, kwargs):
+        hold_h = self._get_param("silent_mode_defrost_hold_h")
+        self._silent_override_until = datetime.datetime.now() + datetime.timedelta(
+            hours=hold_h
+        )
+        self.log(
+            f"[HP] Abtauen beendet -> Silent Mode fuer {hold_h:.1f}h deaktiviert"
+        )
+        self._apply_silent_mode()
+        self.run_in(self._apply_silent_mode, int(hold_h * 3600))
+
     def _set_silent_mode(self, enable: bool):
         if not self._switch_silent_mode:
+            return
+        raw = self.get_state(self._switch_silent_mode)
+        if raw not in ("on", "off"):
+            return  # Sensor (noch) nicht verfuegbar - naechster Tick versucht es erneut
+        current = raw == "on"
+        if current == enable:
             return
         if self._is_dry_run():
             self.log(
@@ -2029,37 +2275,11 @@ class HeatpumpFSM(FSMBase):
             )
             return
         try:
-            self._silent_mode_before_boost = (
-                self.get_state(self._switch_silent_mode) == "on"
-            )
             service = "switch/turn_on" if enable else "switch/turn_off"
             self.call_service(service, entity_id=self._switch_silent_mode)
             self.log(f"[HP] Silent Mode -> {'EIN' if enable else 'AUS'}")
         except Exception as e:
             self.log(f"[HP] Silent Mode setzen fehlgeschlagen: {e}", level="WARNING")
-
-    def _restore_silent_mode(self):
-        if not self._switch_silent_mode or self._silent_mode_before_boost is None:
-            return
-        if self._is_dry_run():
-            self.log("[DRY-RUN] Silent Mode -> Wiederherstellung", level="INFO")
-            return
-        try:
-            service = (
-                "switch/turn_on"
-                if self._silent_mode_before_boost
-                else "switch/turn_off"
-            )
-            self.call_service(service, entity_id=self._switch_silent_mode)
-            self.log(
-                f"[HP] Silent Mode -> wiederhergestellt ({'EIN' if self._silent_mode_before_boost else 'AUS'})"
-            )
-            self._silent_mode_before_boost = None
-        except Exception as e:
-            self.log(
-                f"[HP] Silent Mode wiederherstellen fehlgeschlagen: {e}",
-                level="WARNING",
-            )
 
     def _sync_modbus_setpoints(self, kwargs=None):
         """Zyklischer Modbus-Write fuer 40003/40006.
@@ -2364,6 +2584,12 @@ class HeatpumpFSM(FSMBase):
     def _open_hw_window(self, kwargs):
         self.log(f"[HP] WW-Fenster oeffnet fuer {self._hw_duration_minutes} min")
         self._hw_window_active = True
+        if not self._need_hot_water():
+            self.log(
+                f"[HP] WW-Fenster: Puffer oben {self._buffer_top():.1f}C >= "
+                f"{self._ww_start_threshold():.1f}C -> kein WW-Modus, Zustand "
+                f"'{self.state}' bleibt"
+            )
         self.evaluate_transitions()
         self.run_in(self._close_hw_window, self._hw_duration_minutes * 60)
 

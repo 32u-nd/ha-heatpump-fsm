@@ -67,6 +67,25 @@ heatpump_fsm:
   estop_max_transitions:  10
   estop_window_seconds:   5
 
+  # ── Mischer-Schonung (Stellantrieb-Lebensdauer) ─────────────
+  # Nicht als input_number auf dem Dashboard (HA setzt neue input_number ohne
+  # initial: auf min) - hier einstellbar, wirksam nach AppDaemon-Neustart.
+  # Ein gleichnamiges input_number.hp_<key> hat Vorrang (siehe _get_param).
+  pv_smooth_minutes:        60    # PV-Korrektur: Zeitkonstante der Zusatz-Glaettung (min)
+  mixer_error_db_c:         0.5   # Totband Soll-Ist Kreis 2 fuer den Trim (°C)
+  mixer_move_db_pct:        3     # Fahrbefehl erst ab |Ideal-Ist| >= x %pt
+  mixer_min_move_s:         60    # Mindestabstand zwischen Fahrbefehlen (s)
+  mixer_big_move_pct:       10    # ab dieser Abweichung gilt der Mindestabstand nicht
+  mixer_sensor_tau_s:       60    # Tiefpass Tank-/RL-Fuehler im FF (s, 0 = aus)
+  mixer_start_hold_s:       180   # nach Pumpenstillstand: Position halten (s)
+  mixer_trim_init_max_pct:  8     # max. Trim-Vorbelegung beim Start (%pt)
+  setpoint_tau_s:           45    # Sollwert-Glaettung, zeitbasiert (s)
+
+  # ── Warmwasser ──────────────────────────────────────────────
+  # WW-Modus im WW-Fenster erst wenn Puffer oben < ww_target + x (°C);
+  # darueber bleibt der aktuelle Zustand (z.B. heating) erhalten.
+  ww_start_margin:          1.0
+
   # ── Neustart-Schutz (Backup ~02:05) ─────────────────────────
   # Nach (Neu-)Start: HA-Services-Delay vor erster Transition-Pruefung,
   # damit Sensoren Zeit zum Hochkommen haben (ESPHome reconnect, Recorder).
