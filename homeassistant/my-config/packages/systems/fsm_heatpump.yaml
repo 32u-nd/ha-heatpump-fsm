@@ -224,6 +224,28 @@ fsm_heatpump:
       mode: slider
       # Boost wird beendet wenn PV < X W (Hysterese zu boost_pv_min_w)
 
+    hp_boost_pv_stable_minutes:
+      name: "Boost PV-Stabilitaet vor Start"
+      min: 0
+      max: 30
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-sand
+      mode: slider
+      # PV muss ununterbrochen >= hp_boost_pv_min_w liegen, bevor Boost startet.
+      # Verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von buffer_charge.
+
+    hp_boost_min_minutes:
+      name: "Boost Mindestlaufzeit (Ausstieg)"
+      min: 0
+      max: 60
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+      # Ausstieg (Einlass-Ziel erreicht / PV zu schwach) erst nach dieser Mindestlaufzeit.
+      # Abtauen und Fensterende (boost_window_end) beenden Boost weiterhin sofort.
+
     # ── Warmwasser-Zeiten ───────────────────────────────────────────────────────
     hp_hw_duration_minutes:
       name: "WW Fensterdauer"
@@ -565,6 +587,7 @@ fsm_heatpump:
   # ═══════════════════════════════════════════════════════════════════════════════
   automation:
     - alias: "Modbus: Solltemperatur Kreis 1 (40003)"
+      id: fsm_modbus_write_40003
       triggers:
         - trigger: state
           entity_id: input_number.thermav_40003
@@ -577,6 +600,7 @@ fsm_heatpump:
             value: "{{ (states('input_number.thermav_40003') | float * 10) | int }}"
 
     - alias: "Modbus: Solltemperatur Kreis 2 (40006)"
+      id: fsm_modbus_write_40006
       triggers:
         - trigger: state
           entity_id: input_number.thermav_40006
@@ -589,6 +613,7 @@ fsm_heatpump:
             value: "{{ (states('input_number.thermav_40006') | float * 10) | int }}"
 
     - alias: "Modbus: WW-Solltemperatur (40009)"
+      id: fsm_modbus_write_40009
       triggers:
         - trigger: state
           entity_id: input_number.thermav_40009
@@ -601,6 +626,7 @@ fsm_heatpump:
             value: "{{ (states('input_number.thermav_40009') | float * 10) | int }}"
 
     - alias: "Modbus: Energiezustand (40010)"
+      id: fsm_modbus_write_40010
       triggers:
         - trigger: state
           entity_id: input_number.thermav_40010
@@ -613,6 +639,7 @@ fsm_heatpump:
             value: "{{ states('input_number.thermav_40010') | int }}"
 
     - alias: "AT EMA Update (alle 5 Minuten)"
+      id: fsm_at_ema_update
       triggers:
         - trigger: time_pattern
           minutes: "/5"
@@ -643,6 +670,7 @@ fsm_heatpump:
                 value: "{{ (alpha * at_now + (1 - alpha) * ema_prev) | round(2) }}"
 
     - alias: "Mischer Kalibrierung: FOPDT-Stufentest"
+      id: fsm_mixer_calibration_fopdt_stufentest
       description: >
         Ventil-Kennlinien-Test: FSM auf Dry-Run (kein Modbus/Cover/Pumpen-Write
         durch die FSM selbst), Grundfos-Pumpe manuell an, Mischer faehrt die

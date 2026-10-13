@@ -212,10 +212,17 @@ class HeatpumpFSM(FSMBase):
         "forced_lp_alpha": 0.2,
         "cycling_window_minutes": 60.0,
         "cycling_max_starts": 6,
+        "heating_stall_minutes": 90.0,  # Kompressor so lange AUS in heating/heating_forced -> Alarm [min]
+        "heating_stall_error_c": 2.0,   # ... UND VL-Soll-Ist-Fehler mindestens so gross [°C]
         "circuit1_offset": 1.0,
         "boost_energy_state": 5,
         "boost_pv_min_w": 3500.0,
         "boost_pv_off_w": 1500.0,
+        # PV muss ununterbrochen so lange >= boost_pv_min_w liegen, bevor Boost startet.
+        # Verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von buffer_charge.
+        "boost_pv_stable_minutes": 15.0,
+        # Mindestlaufzeit in buffer_charge_boost vor jedem Ausstieg (ausser Abtauen/Fensterende).
+        "boost_min_minutes": 30.0,
         "pv_buffer_max_kwh": 15.0,
         "heating_hyst": 1.0,  # Hysterese buffer_drain -> idle (°C ueber Heizgrenze)
         # Einlass-Regelung (40002=1): Sollwerte fuer Modbus-Register 40003
@@ -234,6 +241,10 @@ class HeatpumpFSM(FSMBase):
         # Silent Mode: nach Abtauende so lange deaktiviert (volle Leistung fuer
         # schnellere Erholung, weniger Folge-Takte) [h]
         "silent_mode_defrost_hold_h": 2.0,
+        # Kreis 2 PV-Abschaltung: Heizkurven-Sollwert (inkl. PV-Korrektur) unter
+        # vl_high -> PV deckt den Bedarf bereits unter Heizgrenzen-Niveau.
+        "circuit2_pv_off_delay_s": 3600.0,  # Mindestdauer unter vl_high bis Pumpe AUS [s]
+        "circuit2_pv_off_hyst_c": 1.0,      # Wiedereinschalten erst ab vl_high + x [°C]
     }
 
     @property
@@ -382,6 +393,8 @@ class HeatpumpFSM(FSMBase):
         self._decay_start_time = None   # Zeitstempel: Beginn Phase-2-Absenkung
         self._decay_lp_start = None     # LP-Wert beim Start der Absenkung
         self._compressor_on_since = None
+        self._boost_pv_stable_since = None  # seit wann PV ununterbrochen >= boost_pv_min_w ist
+        self._heating_stall_notified = False  # Alarm "Kompressor laeuft trotz heating nicht" schon gemeldet?
         self._forced_end_time = None  # absoluter Zeitstempel: Ende der Mindestlaufzeit
         self._hw_window_active = False
         self._ramp_c1_current = (
@@ -395,6 +408,8 @@ class HeatpumpFSM(FSMBase):
         self._setpoint_ewma_t: datetime.datetime | None = None  # Zeitstempel letzte EWMA-Aktualisierung
         self._pv_ema_kw: float | None = None  # zeitbasierte EMA der PV-Leistung [kW]
         self._pv_ema_t: datetime.datetime | None = None
+        self._circuit2_below_vl_high_since: datetime.datetime | None = None
+        self._circuit2_pv_shutoff: bool = False  # True: Kreis-2-Pumpe wegen PV-Ueberschuss AUS
         self._last_forced_c1: float | None = (
             None  # Ratchet: nur steigende Werte in Mindestlaufzeit
         )
@@ -517,6 +532,16 @@ class HeatpumpFSM(FSMBase):
         """buffer_drain-Schwelle (Entladen statt WP): on-Schwelle + Hysterese.
         Erzeugt totes Band zwischen EIN und AUS - verhindert Takt an der Grenze."""
         return self._buffer_drain_threshold_on() + self._get_param("buffer_drain_hyst")
+
+    def _buffer_drain_entry_threshold(self) -> float:
+        """Einstiegs-Schwelle fuer buffer_drain, abhaengig vom aktuellen Zustand.
+        Aus idle/standby: on-Schwelle - sonst parkt die FSM bei Heizbedarf in idle,
+        solange Puffer 1/2 zwischen on und off liegt (Pumpe aus, Haus unversorgt, bis
+        der Puffer per Standverlust unter die on-Schwelle faellt; Vorfall 2026-10-13).
+        Aus heating: off-Schwelle (on + hyst) - die Hysterese gegen Takt bleibt dort."""
+        if self.state in ("idle", "standby"):
+            return self._buffer_drain_threshold_on()
+        return self._buffer_drain_threshold_off()
 
     @property
     def _ww_target(self) -> float:
@@ -884,10 +909,13 @@ class HeatpumpFSM(FSMBase):
                 "buffer_charge_boost",
                 "standby",
                 lambda: (
-                    self._wp_inlet_temp() >= self._boost_inlet_temp
-                    or self._pv_energy_kwh() < self._pv_buffer_min_kwh * 0.5
+                    self.minutes_in_state() >= self._get_param("boost_min_minutes")
+                    and (
+                        self._wp_inlet_temp() >= self._boost_inlet_temp
+                        or self._pv_energy_kwh() < self._pv_buffer_min_kwh * 0.5
+                    )
                 ),
-                label="Boost-Einlass-Ziel erreicht oder PV weg",
+                label="Boost-Einlass-Ziel erreicht oder PV weg (nach Mindestlaufzeit)",
             ),
             # -- Puffer-Entladen (buffer_drain) -----------------------------------
             # Puffer warm + AT kalt -> Pumpe + Mischer liefern Pufferwaerme, WP bleibt aus.
@@ -910,9 +938,10 @@ class HeatpumpFSM(FSMBase):
                 self._at_above_threshold,
                 label="Kein Heizbedarf (EMA oder AT 1h warm) - Entladen beendet",
             ),
-            # Standby -> Idle: Catch-all wenn heating/buffer_drain/buffer_charge nicht greifen.
-            # Kein AT-Check hier: bei kaltem AT aber Puffer in Totzone (zwischen threshold_on
-            # und threshold_off) wuerde die FSM sonst ewig in standby haengen.
+            # Standby -> Idle: Catch-all wenn heating/buffer_drain/buffer_charge nicht greifen
+            # (AT warm, oder Puffer 1/2 noch unbekannt nach Neustart). Kein AT-Check hier,
+            # damit die FSM nie in standby haengen bleibt. Bei kaltem AT greift vorher immer
+            # heating (Puffer < on-Schwelle) oder buffer_drain (Puffer >= on-Schwelle).
             # idle -> heating / buffer_drain greifen danach wieder mit ihren eigenen Bedingungen.
             Transition(
                 "standby",
@@ -982,6 +1011,9 @@ class HeatpumpFSM(FSMBase):
         self.run_every(self.evaluate_transitions, self.datetime(), 60)
         self.run_every(self._sync_modbus_setpoints, self.datetime(), 60)
         self.run_every(self._apply_silent_mode, self.datetime(), 60)
+        self.run_every(self._update_circuit2_pv_shutoff, self.datetime(), 60)
+        self.run_every(self._check_heating_stall, self.datetime(), 60)
+        self.run_every(self._update_boost_pv_stability, self.datetime(), 60)
         self._schedule_hot_water_windows()
 
         prefix = self.args.get("event_prefix", "fsm_heatpump")
@@ -1064,6 +1096,77 @@ class HeatpumpFSM(FSMBase):
                 self._stop_mixer_controller()
                 self._mixer_full_close()
 
+    def _update_circuit2_pv_shutoff(self, kwargs=None):
+        """Kreis-2-Pumpe im normalen Zustand 'heating' PV-bewusst abschalten.
+
+        _calc_flow_setpoint() enthaelt bereits die PV-Korrektur (Zeile ~1935).
+        Bleibt dieser Sollwert fuer circuit2_pv_off_delay_s unter
+        (vl_high - circuit2_pv_off_hyst_c), deckt die PV den Bedarf schon unter
+        Heizgrenzen-Niveau -> Kreis 2 kann pausieren, ohne Kreis 1/Kompressor
+        (Puffer/WW) zu beeinflussen. Wiedereinschalten schon ab vl_high (nicht
+        vl_high + hyst): der Heizkurvenanteil allein liegt in 'heating' immer
+        > vl_high (AT < heat_curve_at_high per Zustandsdefinition), die Schwelle
+        ist also ausser bei starker PV immer erreichbar. Hysterese sitzt deshalb
+        nur auf der Abschalt-Seite (Pendelschutz), nicht auf der Wiedereinschalt-
+        Seite - sonst bliebe die Pumpe knapp unterhalb der Heizgrenze dauerhaft
+        aus (Bug: Review 2026-10-03, Opus-Agent).
+        Sicherheitsseite: faellt der AT-Sensor aus (kein Cache, Startup-Default
+        30C) oder laeuft die Startup-Grace, wird nie pausiert und eine laufende
+        Pause sofort beendet - nie auf Default-/Fallback-Werten abschalten.
+        Nur im Zustand 'heating' aktiv - buffer_charge/boost haben mit
+        _update_charge_heating() bereits eine eigene (AT-basierte) Pumpensteuerung.
+        """
+        if self.state != "heating":
+            self._circuit2_below_vl_high_since = None
+            self._circuit2_pv_shutoff = False
+            return
+        if self._in_startup_grace() or self._outdoor_temp_cache is None:
+            self._circuit2_below_vl_high_since = None
+            if self._circuit2_pv_shutoff:
+                self._circuit2_pv_shutoff = False
+                self._pump_on()
+                self._pi_prev_error = self._calc_flow_setpoint() - self._flow_temp()
+                self._pi_position = self._pi_start_position()
+                self._start_mixer_controller()
+                self.log(
+                    "[HP] Kreis 2 PV-Pause Ende: AT-Sensor ohne Cache/Startup-Grace "
+                    "-> Pumpe/Mischer sicherheitshalber wieder AN"
+                )
+            return
+        vl_high = self._get_param("heat_curve_vl_high")
+        hyst = self._get_param("circuit2_pv_off_hyst_c")
+        sp = self._calc_flow_setpoint()
+        now = datetime.datetime.now()
+        if sp < vl_high - hyst:
+            if self._circuit2_below_vl_high_since is None:
+                self._circuit2_below_vl_high_since = now
+            elapsed = (now - self._circuit2_below_vl_high_since).total_seconds()
+            if (
+                not self._circuit2_pv_shutoff
+                and elapsed >= self._get_param("circuit2_pv_off_delay_s")
+            ):
+                self._circuit2_pv_shutoff = True
+                self._pump_off()
+                if self._mixer_handle is not None:
+                    self._stop_mixer_controller()
+                    self._mixer_full_close()
+                self.log(
+                    f"[HP] Kreis 2 PV-Pause: Sollwert={sp:.1f}C < vl_high-hyst="
+                    f"{vl_high - hyst:.1f}C seit {elapsed/60.0:.0f}min -> Pumpe/Mischer AUS"
+                )
+        else:
+            self._circuit2_below_vl_high_since = None
+            if self._circuit2_pv_shutoff and sp >= vl_high:
+                self._circuit2_pv_shutoff = False
+                self._pump_on()
+                self._pi_prev_error = sp - self._flow_temp()
+                self._pi_position = self._pi_start_position()
+                self._start_mixer_controller()
+                self.log(
+                    f"[HP] Kreis 2 PV-Pause Ende: Sollwert={sp:.1f}C >= "
+                    f"vl_high={vl_high:.1f}C -> Pumpe/Mischer wieder AN"
+                )
+
     def _do_transition(self, t):
         """Nach jedem Zustandswechsel Silent Mode sofort abgleichen (nicht erst
         beim naechsten 60s-Tick) - deckt auch den Austritt aus buffer_charge/
@@ -1076,6 +1179,8 @@ class HeatpumpFSM(FSMBase):
     # -------------------------------------------------------------------------
 
     def on_enter_heating(self):
+        self._circuit2_below_vl_high_since = None
+        self._circuit2_pv_shutoff = False
         self._pump_on()
         sp = self._calc_flow_setpoint()
         self._pi_prev_error = sp - self._flow_temp()
@@ -1278,7 +1383,8 @@ class HeatpumpFSM(FSMBase):
             f"[HP] Puffer-Entladen | Kreis-2-Pumpe EIN, WP AUS | "
             f"Vorlauf-Soll: {sp:.1f}C | "
             f"Puffer 1/2: {self._buffer_mid():.1f}C 1/4: {self._buffer_bottom():.1f}C "
-            f"(Drain-Grenze 1/2: EIN>={self._buffer_drain_threshold_off():.1f}C / AUS<{self._buffer_drain_threshold_on():.1f}C)"
+            f"(Drain-Grenze 1/2: EIN>={self._buffer_drain_threshold_on():.1f}C aus idle/standby, "
+            f">={self._buffer_drain_threshold_off():.1f}C aus heating / AUS<{self._buffer_drain_threshold_on():.1f}C)"
         )
 
     def on_exit_buffer_drain(self):
@@ -1635,7 +1741,6 @@ class HeatpumpFSM(FSMBase):
         thr = self._heating_threshold
         mid = self._buffer_mid()
         thr_on = self._buffer_drain_threshold_on()
-        thr_off = self._buffer_drain_threshold_off()
         mins = self.minutes_in_state()
 
         def yn(cond: bool) -> str:
@@ -1649,7 +1754,7 @@ class HeatpumpFSM(FSMBase):
             # Entry: EMA; Exit: 1h-Mittelwert
             msg += (
                 f" | AT_EMA={at_ema:.1f}C AT_1h={at_1h:.1f}C(Grenze={thr:.1f})"
-                f" | Puf1/2={mid:.1f}C(DrainAN>={thr_off:.1f} AUS<{thr_on:.1f})"
+                f" | Puf1/2={mid:.1f}C(DrainAN>={self._buffer_drain_entry_threshold():.1f} AUS<{thr_on:.1f})"
             )
             above = self._at_above_threshold()
             if state == "buffer_drain":
@@ -1775,6 +1880,7 @@ class HeatpumpFSM(FSMBase):
     def _need_buffer_drain(self) -> bool:
         """Puffer hat noch genug Waerme, AT kalt - Pumpe liefert Pufferwaerme ans Haus.
         WP bleibt aus. Uebergang zu heating wenn Puffer 1/2 < Sollwert + buffer_drain_margin.
+        Einstiegs-Schwelle zustandsabhaengig, siehe _buffer_drain_entry_threshold().
 
         Verwendet buffer_mid (1/2) statt buffer_bottom (1/4): Nach PV-Ladung oder
         Heizzyklen ist der Pufferboden oft kalt (Ruecklauf), waehrend die oberen Zonen
@@ -1785,7 +1891,7 @@ class HeatpumpFSM(FSMBase):
         return (
             self._outdoor_temp() < self._heating_threshold
             and self._outdoor_temp_1h() < self._heating_threshold
-            and self._buffer_mid() >= self._buffer_drain_threshold_off()
+            and self._buffer_mid() >= self._buffer_drain_entry_threshold()
         )
 
     def _should_charge_buffer(self) -> bool:
@@ -1829,17 +1935,38 @@ class HeatpumpFSM(FSMBase):
             < self._buffer_charge_inlet_temp  # Tank 1/4 als Vorcheck (pumpenunabhaengig)
         )
 
+    def _update_boost_pv_stability(self, kwargs=None):
+        """60-s-Tick, zustandsunabhaengig: merkt sich seit wann PV ununterbrochen
+        >= boost_pv_min_w liegt. Grundlage fuer die Stabilitaets-Sperre in _should_boost
+        (verhindert Boost-Start durch kurze PV-Spitzen)."""
+        if self._pv_power_w() >= self._boost_pv_min_w:
+            if self._boost_pv_stable_since is None:
+                self._boost_pv_stable_since = datetime.datetime.now()
+        else:
+            self._boost_pv_stable_since = None
+
+    def _boost_pv_stable_minutes_elapsed(self) -> float:
+        if self._boost_pv_stable_since is None:
+            return 0.0
+        return (
+            datetime.datetime.now() - self._boost_pv_stable_since
+        ).total_seconds() / 60
+
     def _should_boost(self) -> bool:
         """Boost aktivieren wenn PV stark genug und Einlass-Temp noch unter Boost-Ziel.
         boost_inlet_min_c: Mindest-Einlass bevor Boost startet (Puffer muss schon warm sein).
         Mit 40002=1: Boost hebt Einlass-Ziel von buffer_charge_inlet_temp auf boost_inlet_temp.
+        PV muss zudem boost_pv_stable_minutes ununterbrochen stabil sein (_update_boost_pv_stability).
         """
         if self._binary_defrost:
             if self.get_state(self._binary_defrost) == "on":
                 return False
         if not self._in_boost_window():
             return False
-        if self._pv_power_w() < self._boost_pv_min_w:
+        if (
+            self._boost_pv_stable_minutes_elapsed()
+            < self._get_param("boost_pv_stable_minutes")
+        ):
             return False
         if (
             self._wp_inlet_temp() < self._boost_inlet_min_c
@@ -1852,12 +1979,16 @@ class HeatpumpFSM(FSMBase):
         return True
 
     def _should_stop_boost(self) -> bool:
+        """Harte Gruende (Abtauen, Fensterende) beenden Boost sofort. Der weiche Grund
+        (PV zu schwach) greift erst nach boost_min_minutes Mindestlaufzeit."""
         if self._binary_defrost:
             if self.get_state(self._binary_defrost) == "on":
                 return True
-        if self._pv_power_w() < self._boost_pv_off_w:
-            return True
         if not self._in_boost_window():
+            return True
+        if self.minutes_in_state() < self._get_param("boost_min_minutes"):
+            return False
+        if self._pv_power_w() < self._boost_pv_off_w:
             return True
         return False
 
@@ -2450,6 +2581,70 @@ class HeatpumpFSM(FSMBase):
                 f"[HP] WARNUNG: {count}/{max_starts} Verdichter-Starts in {window_min:.0f} min",
                 level="WARNING",
             )
+
+    def _check_heating_stall(self, kwargs):
+        """Watchdog: Kompressor bleibt in heating/heating_forced ueber
+        heating_stall_minutes AUS, obwohl VL-Soll deutlich (>= heating_stall_error_c)
+        ueber VL-Ist liegt -> die FSM fordert Waerme an, die WP liefert aber keine.
+        Ursache liegt dann ausserhalb der FSM (z.B. Kreis 1 am LG-Geraet deaktiviert,
+        interne Stoerung, Notbetrieb) - die FSM kann das nicht beheben, nur melden.
+        Einmalige Meldung pro Vorfall (Reset sobald der Kompressor wieder anspringt
+        oder der Zustand wechselt)."""
+        if self.state not in ("heating", "heating_forced"):
+            if self._heating_stall_notified:
+                self._heating_stall_notified = False
+                self._dismiss_heating_stall_notification()
+            return
+        if self._compressor_on_since is not None:
+            if self._heating_stall_notified:
+                self._heating_stall_notified = False
+                self.log("[HP] Heizungs-Stillstand behoben - Kompressor laeuft wieder")
+                self._dismiss_heating_stall_notification()
+            return
+        if self._heating_stall_notified:
+            return
+        stall_min = self._get_param("heating_stall_minutes")
+        mins = self.minutes_in_state()
+        if mins < stall_min:
+            return
+        setpoint = self._calc_flow_setpoint_smoothed()
+        actual = self._flow_temp()
+        if actual is None:
+            return
+        err_min = self._get_param("heating_stall_error_c")
+        if setpoint - actual < err_min:
+            return
+        self._heating_stall_notified = True
+        msg = (
+            f"Zustand '{self.state}' seit {mins:.0f} min, Kompressor laeuft nicht "
+            f"(VL-Soll {setpoint:.1f}C, Ist {actual:.1f}C, e={setpoint - actual:+.1f}C). "
+            "LG-Geraet/Display pruefen (Kreis 1 evtl. deaktiviert, Fehlercode, Notbetrieb)."
+        )
+        self.log(f"[HP] ! HEIZUNG STEHT: {msg}", level="ERROR")
+        try:
+            self.call_service(
+                "persistent_notification/create",
+                title="! WP heizt nicht",
+                message=msg,
+                notification_id="fsm_heating_stall",
+            )
+        except Exception as e:
+            self.log(f"[HP] Heizungs-Stillstand persistent_notification fehlgeschlagen: {e}", level="ERROR")
+        try:
+            self.call_service(
+                "notify/signal_k4",
+                message=f"\U0001F6A8 WP heizt nicht! {msg}",
+            )
+        except Exception as e:
+            self.log(f"[HP] Heizungs-Stillstand Signal-Benachrichtigung fehlgeschlagen: {e}", level="ERROR")
+
+    def _dismiss_heating_stall_notification(self):
+        try:
+            self.call_service(
+                "persistent_notification/dismiss", notification_id="fsm_heating_stall"
+            )
+        except Exception as e:
+            self.log(f"[HP] Heizungs-Stillstand-Dismiss fehlgeschlagen: {e}", level="ERROR")
 
     def _on_aux_heater_change(self, entity, attribute, old, new, kwargs):
         state_name = "EIN" if new == "on" else "AUS"

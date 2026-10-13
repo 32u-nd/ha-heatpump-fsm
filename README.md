@@ -120,6 +120,13 @@ threshold_off = threshold_on + buffer_drain_hyst
 Keine PV-Korrektur in den Schwellen (verhindert PV-Jitter-Takt).
 Hysterese zwischen EIN und AUS verhindert Takt an der Grenze.
 
+**Einstiegsschwelle für `buffer_drain` ist zustandsabhängig:** aus `idle`/`standby` gilt
+bereits `threshold_on`, aus `heating` gilt weiterhin `threshold_off` (= `threshold_on` +
+Hysterese). Ohne diese Unterscheidung parkte die FSM bei Heizbedarf in `idle`, solange der
+Puffer 1/2 zwischen `threshold_on` und `threshold_off` lag — Pumpe aus, Haus unversorgt, bis
+der Puffer per Standverlust unter `threshold_on` fiel (Vorfall 2026-10-13). Die Hysterese
+bleibt beim Austritt aus `heating` wirksam, um dort kein Takten zu erzeugen.
+
 ---
 
 ### Regelungskonzept
@@ -185,6 +192,25 @@ Eine **Mindestlaufzeit** (`buffer_charge_min_minutes`, Default 5 min) schützt v
 Sommerbetrieb: Die WP-interne Pumpe liest beim Start sofort heißes Rohrrestwasser aus dem
 vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fälschlicherweise feuern.
 
+**Heizstab-Boost — Start- und Ausstiegs-Schutz:** PV muss `boost_pv_stable_minutes`
+(Default 15 min) ununterbrochen ≥ `boost_pv_min_w` liegen, bevor der Boost startet —
+verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von `buffer_charge`. Einmal
+gestartet, läuft der Boost mindestens `boost_min_minutes` (Default 30 min), bevor der weiche
+Ausstiegsgrund (PV zu schwach) greift. Harte Gründe — Abtauen, Fensterende — beenden den
+Boost weiterhin sofort, unabhängig von der Mindestlaufzeit.
+
+#### Kreis 2 PV-Abschaltung in `heating`
+
+Deckt die PV-Korrektur den Wärmebedarf bereits unter Heizgrenzen-Niveau (Heizkurven-Sollwert
+inkl. PV-Korrektur < `heat_curve_vl_high − circuit2_pv_off_hyst_c`, anhaltend für
+`circuit2_pv_off_delay_s`, Default 1 h), pausiert Kreis 2 (Pumpe + Mischer, eingefroren)
+ohne Kreis 1/Kompressor (Puffer/WW) zu beeinflussen. Wiedereinschalten bereits ab
+`heat_curve_vl_high` (ohne Hysterese) — der reine Heizkurvenanteil liegt in `heating` per
+Zustandsdefinition immer darüber, die Hysterese sitzt nur auf der Abschalt-Seite gegen
+Pendeln. Nur im Zustand `heating` aktiv; `buffer_charge`/`buffer_charge_boost` haben eine
+eigene AT-basierte Pumpensteuerung. Sicherheitsseite: Fällt der AT-Sensor ohne Cache aus
+oder läuft die Startup-Grace, wird nie pausiert und eine laufende Pause sofort beendet.
+
 #### Kreis 1 in buffer_drain / standby / idle
 
 In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Heizkurven-Sollwert und werden bei AT-, PV- und Parameter-Änderungen nachgeführt. Die WP ist aus; die Register bleiben aktuell für einen sauberen Neustart.
@@ -237,6 +263,18 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | `ww_start_margin` | 1,0 °C | WW-Modus im WW-Fenster erst wenn Puffer oben < `ww_target` + x |
 | `silent_mode_defrost_hold_h` | 2 h | Nach Abtauende: Silent Mode für diese Dauer deaktiviert (schnellere Erholung) |
 
+#### Heizstab-Boost
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `hp_boost_pv_stable_minutes` | 15 min | PV muss so lange ununterbrochen ≥ `boost_pv_min_w` liegen, bevor Boost startet |
+| `hp_boost_min_minutes` | 30 min | Mindestlaufzeit, bevor der weiche Ausstiegsgrund (PV zu schwach) greift |
+
+#### Kreis 2 PV-Abschaltung
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `circuit2_pv_off_delay_s` | 3600 s | Mindestdauer unter `vl_high − hyst`, bis Pumpe/Mischer aus |
+| `circuit2_pv_off_hyst_c` | 1 °C | Abschalt-seitige Hysterese (Wiedereinschalten ab `vl_high`, ohne Hysterese) |
+
 #### Verdichterschutz
 | Parameter | Default | Beschreibung |
 |---|---|---|
@@ -268,6 +306,7 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | **AT EMA Persistenz** | EMA-Wert überlebt HA-Neustarts. `hp_at_ema_value` hat kein `initial:` — HA überschreibt bei gesetztem `initial:` immer den gespeicherten Zustand. Template-Sensor gibt `none` bei unbekanntem Zustand (AT-Fallback greift). Automation: `time_pattern /5min`; Sentinel `ema_prev ≥ 90` initialisiert beim Erst-Deploy |
 | **Mischer Position-Erhalt** | `standby` und `hot_water` frieren Mischerposition ein (kein Fahrbefehl, Position in `_last_pi_position` gesichert). `idle` schließt als einziger Zustand aktiv. PI startet beim nächsten `heating`/`buffer_drain` von gespeicherter Position |
 | **Silent Mode** | Pauschal aktiv, Ausnahme `buffer_charge`/`buffer_charge_boost` (zügiges Laden) und ein `silent_mode_defrost_hold_h`-Fenster nach jedem Abtauende (schnellere Erholung, seltener Folge-Takt). Abgleich zentral in `_do_transition()` nach jedem Zustandswechsel — deckt auch Boost-Austritt ab, nicht nur den Eintritt. Beim AppDaemon-Start Sync mit dem aktuellen Zustand |
+| **Heizungs-Stillstand-Watchdog** | 60-s-Tick (`_check_heating_stall`): Bleibt der Kompressor in `heating`/`heating_forced` länger als `heating_stall_minutes` (Default 90 min) aus, während VL-Soll−Ist ≥ `heating_stall_error_c` (Default 2 °C) ist, liegt die Ursache außerhalb der FSM (z. B. Kreis 1 am Gerät deaktiviert, Fehlercode, Notbetrieb) — die FSM kann das nicht beheben, meldet es aber einmalig per persistenter HA-Benachrichtigung und Signal. Reset sobald der Kompressor wieder anspringt oder der Zustand wechselt |
 
 ---
 
@@ -445,6 +484,14 @@ threshold_off = threshold_on + buffer_drain_hyst
 No PV correction in thresholds (prevents PV-jitter cycling).
 Hysteresis between ON and OFF prevents cycling at the boundary.
 
+**The entry threshold for `buffer_drain` is state-dependent:** from `idle`/`standby`,
+`threshold_on` already applies; from `heating`, `threshold_off` (= `threshold_on` +
+hysteresis) still applies. Without this distinction the FSM would park in `idle` while
+heating was needed, as long as the buffer mid sensor sat between `threshold_on` and
+`threshold_off` — pump off, house unserved, until the buffer fell below `threshold_on` from
+standing losses (incident 2026-10-13). The hysteresis stays in effect on exit from `heating`
+to avoid cycling there.
+
 ---
 
 ### Control Concept
@@ -505,6 +552,30 @@ With `40002=1` (inlet control), the HP regulates to the **inlet** temperature
 (return from buffer bottom). Inlet ≥ target ⇒ entire buffer ≥ target (stratification).
 Natural "buffer full" condition — no cycling from premature outlet detection.
 
+A **minimum runtime** (`buffer_charge_min_minutes`, default 5 min) protects against a false
+exit in summer mode: the HP's internal pump reads hot residual pipe water from the previous
+cycle immediately on start — without a minimum runtime the exit condition would wrongly
+fire after a few seconds.
+
+**Heating-rod boost — start and exit protection:** PV must stay continuously ≥
+`boost_pv_min_w` for `boost_pv_stable_minutes` (default 15 min) before boost starts —
+prevents short boosts (< 1 min) from brief PV spikes at the end of `buffer_charge`. Once
+started, boost runs for at least `boost_min_minutes` (default 30 min) before the soft exit
+condition (PV too weak) applies. Hard reasons — defrost, window end — still stop boost
+immediately regardless of minimum runtime.
+
+#### Circuit 2 PV shutoff in `heating`
+
+When the PV correction already covers heat demand below the heating-limit level (heating
+curve setpoint incl. PV correction < `heat_curve_vl_high − circuit2_pv_off_hyst_c`,
+sustained for `circuit2_pv_off_delay_s`, default 1 h), circuit 2 pauses (pump + mixer,
+frozen) without affecting circuit 1/compressor (buffer/DHW). Re-enables already at
+`heat_curve_vl_high` (no hysteresis) — the heating-curve component alone always exceeds
+that in `heating` by state definition, so hysteresis only sits on the shutoff side against
+cycling. Active only in state `heating`; `buffer_charge`/`buffer_charge_boost` have their
+own OAT-based pump control. Safety side: if the OAT sensor has no cache or startup grace is
+active, it never pauses and ends an active pause immediately.
+
 #### Circuit 1 in buffer_drain / standby / idle
 
 In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating curve setpoint, updated on OAT, PV, and parameter changes. The HP is off; registers stay current for a clean restart.
@@ -557,6 +628,18 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | `ww_start_margin` | 1.0 °C | DHW mode in the DHW window only once buffer top < `ww_target` + x |
 | `silent_mode_defrost_hold_h` | 2 h | Silent mode disabled for this long after defrost ends |
 
+#### Heating-rod boost
+| Parameter | Default | Description |
+|---|---|---|
+| `hp_boost_pv_stable_minutes` | 15 min | PV must stay ≥ `boost_pv_min_w` this long, uninterrupted, before boost starts |
+| `hp_boost_min_minutes` | 30 min | Minimum runtime before the soft exit condition (PV too weak) applies |
+
+#### Circuit 2 PV shutoff
+| Parameter | Default | Description |
+|---|---|---|
+| `circuit2_pv_off_delay_s` | 3600 s | Minimum time below `vl_high − hyst` before pump/mixer shut off |
+| `circuit2_pv_off_hyst_c` | 1 °C | Shutoff-side hysteresis (re-enable at `vl_high`, no hysteresis) |
+
 #### Compressor protection
 | Parameter | Default | Description |
 |---|---|---|
@@ -587,6 +670,7 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | **OAT EMA persistence** | EMA survives HA restarts. `hp_at_ema_value` has no `initial:` — HA always overrides restored state when `initial:` is set in YAML. Template sensor returns `none` when unknown (OAT fallback 30 °C applies). Automation: `time_pattern /5min`; sentinel `ema_prev ≥ 90` initialises on first deploy |
 | **Mixer position retention** | `standby` and `hot_water` freeze the mixer position (no travel command, position saved in `_last_pi_position`). `idle` is the only state that actively closes the mixer. PI resumes from the saved position on next `heating`/`buffer_drain` |
 | **Silent mode** | On by default, except `buffer_charge`/`buffer_charge_boost` (fast charging) and a `silent_mode_defrost_hold_h` window after each defrost ends (faster recovery, fewer follow-up cycles). Reconciled centrally in `_do_transition()` after every state change — also covers boost exit, not just entry. Synced with the current state on AppDaemon start |
+| **Heating-stall watchdog** | 60 s tick (`_check_heating_stall`): if the compressor stays off in `heating`/`heating_forced` for longer than `heating_stall_minutes` (default 90 min) while setpoint−actual flow temp ≥ `heating_stall_error_c` (default 2 °C), the cause lies outside the FSM (e.g. circuit 1 disabled on the unit, error code, emergency mode) — the FSM cannot fix it but reports it once via a persistent HA notification and Signal. Resets once the compressor runs again or the state changes |
 
 ---
 
