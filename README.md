@@ -34,7 +34,7 @@ Alle Parameter sind zur Laufzeit über das HA-Dashboard (`input_number.hp_*`) an
 | PV-Sensoren | Momentanleistung (W) und Tagesrest (kWh) in HA |
 
 **Hydraulikkonzept — zwei Kreise:**
-- **Kreis 1** (Modbus 40003): WP-interner Regelkreis. In `heating` und `heating_forced` schreibt der FSM einen LP-gefilterten WP-Auslass-Wert + Offset, damit die WP-interne Hysterese (Verdichter stoppt wenn Auslass > Kreis1 + 4 °C) nicht vor Ablauf der Mindestlaufzeit greift. In `heating` gibt es zwei Phasen: Phase 1 (< 45 min) folgt dem Auslass bidirektional (Untergrenze: Heizkurve); Phase 2 (≥ 45 min) sinkt Kreis1 linear 1 °C/5 min zur Heizkurve zurück — WP stoppt intern von selbst. Wenn der Verdichter intern abschaltet, springt Kreis1 sofort auf `Heizkurve + circuit1_offset` (sauberer Start für nächsten Zyklus). In `buffer_drain`, `idle` und `standby` folgt Kreis1 normal der Heizkurve. In `buffer_charge` wird stattdessen die Einlass-Zieltemperatur gesetzt.
+- **Kreis 1** (Modbus 40003): WP-interner Regelkreis, bezogen auf den LG-Auslass (Modbus 30004, nicht mehr der Dallas-Anlegefühler — der lag ≈ 3,9 K tiefer). In `heating` und `heating_forced` schreibt der FSM einen LP-gefilterten WP-Auslass-Wert + `forced_setpoint_offset` (Default **−3 °C**; mit dem Wechsel auf 30004 muss die Summe aus `forced_setpoint_offset` + `circuit1_offset` ≤ 0 bleiben, sonst Mitkopplung — die FSM warnt beim Start sonst per Log), damit die WP-interne Hysterese (Verdichter stoppt wenn Auslass > Kreis1 + 4 °C) nicht vor Ablauf der Mindestlaufzeit greift. In `heating` gibt es drei Phasen: **Startmodus** (Verdichter aus, `heating_restart_pause_minutes` nach dem letzten AUS abgelaufen) setzt Kreis1 = Puffer 1/4 + `heating_start_margin_c`, da der LG-Auslass im Stillstand veraltet ist und Kurve + 1 K zu knapp am Wasser lag, um die WP anzufahren; Phase 1 (< 45 min, Verdichter läuft) folgt dem Auslass bidirektional (Untergrenze: Heizkurve); Phase 2 (≥ 45 min **und** Puffer 1/2 ≥ `buffer_drain`-AUS-Schwelle) sinkt Kreis1 linear 1 °C/10 min zur Heizkurve zurück — WP stoppt intern von selbst (ohne die Puffer-Bedingung stoppte die LG in Praxistests knapp unter der Schwelle, FSM blieb unnötig in `heating`). In `buffer_drain`, `idle` und `standby` folgt Kreis1 normal der Heizkurve. In `buffer_charge` wird stattdessen die Einlass-Zieltemperatur gesetzt.
 - **Kreis 2** (Modbus 40006): Heizkreis mit Heizkörpern im Haus. Vorlauftemperatur wird durch den 3-Wege-Mischer (PI-Regler) geregelt; der FSM schreibt den Heizkurven-Sollwert.
 
 ---
@@ -67,12 +67,17 @@ Parameter-Lesekette: `HA input_number` → `apps.yaml` → `_DEFAULTS`.
 Oben   ┌─────────────────────────┐  ← buffer_top     WW-Zone (Ziel: ww_target)
 3/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_mid_high
 1/2    ├═════════════════════════┤  ← buffer_mid     Vorlauf-Stutzen · Heizung EIN/AUS + buffer_drain-Schwelle
-1/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_bottom  Rücklaufzone · nur Vorcheck PV-Ladung
+                                                       + PV-Ladung-Neustart-Hysterese
+1/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_bottom  Rücklaufzone · Vorcheck PV-Ladung + heating-Startmodus
 Unten  └─────────────────────────┘
 ```
 
-EIN- und AUS-Entscheidung: 1/2-Fühler (`buffer_mid`, Höhe des Vorlauf-Stutzens) — einheitlicher Schaltpunkt.
-Der 1/4-Fühler ist die Rücklaufzone (bleibt im Heizbetrieb kalt) und dient nur als pumpenunabhängiger Vorcheck bei der PV-Ladung.
+EIN- und AUS-Entscheidung: 1/2-Fühler (`buffer_mid`, Höhe des Vorlauf-Stutzens) — einheitlicher Schaltpunkt,
+auch für die Neustart-Hysterese nach PV-Ladung (vorher 1/4, siehe unten).
+Der 1/4-Fühler ist die Rücklaufzone (bleibt im Heizbetrieb kalt) und dient als pumpenunabhängiger Vorcheck
+bei der PV-Ladung sowie als Zielgröße für den `heating`-Startmodus (siehe Kreis 1 oben).
+Der WW-Einstieg/-Ausstieg hängt nicht an `buffer_top`, sondern am separaten LG-WW-Fühler (Modbus 30006,
+`sensor_ww_temp`) — siehe unten.
 
 ---
 
@@ -98,17 +103,25 @@ AT kalt, Puffer warm:   idle → buffer_drain → heating → buffer_drain → .
 AT kalt, Puffer kalt:   idle → heating → ...
 Komp. intern gestoppt:  heating → buffer_drain (Puffer warm) → heating (Puffer kalt)
 Puffer 1/2 voll:        heating → heating_forced / standby
-WW-Fenster + Puffer oben knapp:  (beliebig; standby nach Pause) → hot_water → standby
+WW-Fenster + LG-WW-Fühler (30006) knapp:  (beliebig; standby nach Pause) → hot_water → standby
 PV-Überschuss:          idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
 
 **WW-Vorrang ist konditional:** Die FSM wechselt im WW-Fenster nur nach `hot_water`, wenn
-der Puffer oben unter `ww_target + ww_start_margin` fällt — ist er noch warm genug, bleibt
-der aktuelle Zustand (z. B. `heating`) unverändert bestehen, der Heizkreis wird nicht
-unnötig unterbrochen. Fällt der Puffer erst während einer `standby`-Pause unter die
-Schwelle, startet WW nach Ablauf der Pause. Einmal in `hot_water`, bleibt die FSM dort bis
-das Fenster schließt (kein Pendeln). Fühlerausfall liefert `48 °C` → WW-Modus wie bisher
-(sichere Seite).
+der LG-WW-Fühler (Modbus 30006, Parameter `sensor_ww_temp`) unter `ww_target − ww_lg_hysteresis`
+fällt — das ist der Einschaltpunkt der LG selbst. Darüber lädt die LG ohnehin nicht, also bleibt
+der aktuelle Zustand (z. B. `heating`) unverändert bestehen, der Heizkreis wird nicht unnötig
+unterbrochen (vorher wurde nach `buffer_top` entschieden; am 2026-10-23 führte das zu einem
+Einstieg, bei dem die LG gar nicht lud — 60 min ohne Heizung). Fällt der Fühler erst während
+einer `standby`-Pause unter die Schwelle, startet WW nach Ablauf der Pause. **Austritt:**
+30006 ≥ `ww_target`, oder das Fenster schließt (kein Pendeln währenddessen). Fühlerausfall
+(30006 unbekannt) → WW-Modus wie bisher (sichere Seite), aber kein automatischer Austritt über
+die Zieltemperatur — dann greifen nur Fensterende bzw. Zeitlimit.
+
+**Manuell erzwungenes WW** (`force_state`/`input_select`, auch außerhalb des Fensters): die FSM
+bleibt in `hot_water`, bis 30006 ≥ `ww_target`, spätestens nach `hw_manual_max_min` (Default
+60 min), oder bis der Zustand manuell verlassen wird. Das Flag geht bei einem AppDaemon-Neustart
+verloren.
 
 #### buffer_drain / heating Schwellen (dynamisch)
 
@@ -192,6 +205,16 @@ Eine **Mindestlaufzeit** (`buffer_charge_min_minutes`, Default 5 min) schützt v
 Sommerbetrieb: Die WP-interne Pumpe liest beim Start sofort heißes Rohrrestwasser aus dem
 vorherigen Zyklus — ohne Mindestlaufzeit würde der Ausstieg nach Sekunden fälschlicherweise feuern.
 
+PV-Ladung startet außerdem nur bei PV-Momentanleistung ≥ `pv_charge_min_w` (Default 2000 W) —
+die reine Prognose (`pv_buffer_min_kwh`) ließ am 2026-10-23 bei nur 0,7 kW Momentanleistung mit
+Netzstrom-Zuschuss laden.
+
+**Neustart-Hysterese nach Ladung** (`buffer_charge_hyst`, Default 5 °C): nach dem Abschalten
+(`_buffer_fully_charged = True`) startet die nächste Ladung erst wieder, wenn **Puffer 1/2**
+unter `buffer_charge_inlet_temp − buffer_charge_hyst` fällt — nicht Puffer 1/4. Der 1/4-Fühler
+kühlt beim Entladen über den Heizkreis-Rücklauf in ~25 min um 5 K ab, während 1/2 noch voll ist,
+was die Hysterese vorzeitig zurücksetzte.
+
 **Heizstab-Boost — Start- und Ausstiegs-Schutz:** PV muss `boost_pv_stable_minutes`
 (Default 15 min) ununterbrochen ≥ `boost_pv_min_w` liegen, bevor der Boost startet —
 verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von `buffer_charge`. Einmal
@@ -237,6 +260,8 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 |---|---|---|
 | `hp_buffer_drain_margin` | 3 °C | Abstand der EIN-Schwelle über Heizkurve |
 | `hp_buffer_drain_hyst` | 2 °C | Totband EIN/AUS |
+| `pv_charge_min_w` | 2000 W | PV-Ladung startet nur bei Momentanleistung ≥ x (nicht allein nach Prognose) |
+| `buffer_charge_hyst` | 5 °C | Neustart-Hysterese nach Ladung, bezogen auf Puffer 1/2 |
 
 #### Mischer: Feedforward + Trim
 | Parameter | Default | Beschreibung |
@@ -260,7 +285,8 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 #### Warmwasser & Silent Mode
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `ww_start_margin` | 1,0 °C | WW-Modus im WW-Fenster erst wenn Puffer oben < `ww_target` + x |
+| `ww_lg_hysteresis` | 1,0 °C | WW-Modus im WW-Fenster erst wenn 30006 < `ww_target` − x (= LG-Einschaltpunkt) |
+| `hw_manual_max_min` | 60 min | Manuell erzwungenes WW: Zeitlimit, falls `ww_target` nie erreicht wird |
 | `silent_mode_defrost_hold_h` | 2 h | Nach Abtauende: Silent Mode für diese Dauer deaktiviert (schnellere Erholung) |
 
 #### Heizstab-Boost
@@ -280,8 +306,10 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 |---|---|---|
 | `hp_min_runtime_minutes` | 45 min | Mindestlaufzeit Verdichter |
 | `hp_standby_minutes` | 3 min | Schutzpause zwischen Zyklen |
-| `hp_forced_setpoint_offset` | 1 °C | Kreis-1-Offset über LP-Wert (in `heating` und `heating_forced`) |
+| `hp_forced_setpoint_offset` | −3 °C | Kreis-1-Offset über LP-Wert (in `heating` und `heating_forced`), bezogen auf den LG-Auslass (30004); Summe mit `circuit1_offset` muss ≤ 0 bleiben |
 | `hp_forced_lp_alpha` | 0,2 | LP-Filter-Alpha WP-Auslass (in `heating` und `heating_forced`) |
+| `heating_start_margin_c` | 3 °C | Startmodus `heating`: Kreis 1 = Puffer 1/4 + diese Marge, damit die LG anläuft |
+| `heating_restart_pause_minutes` | 10 min | Nach internem Verdichter-AUS in `heating` so lange kein Startmodus (Kreis 1 folgt weiter dem Tracking) |
 | `hp_cycling_window_minutes` | 60 min | Takt-Schutz: Beobachtungsfenster |
 | `hp_cycling_max_starts` | 6 | Takt-Schutz: Max-Starts → Dry-Run |
 
@@ -296,9 +324,9 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | **Dry-Run** | FSM aktiv, kein Modbus-/Cover-Write; Hardware-Sync beim Deaktivieren |
 | **AT-Fallback (asymmetrisch)** | Einschalt-Checks: Startup-Default 30 °C (kein Heizbedarf), letzter gültiger AT gecacht (EMA und 1h-Sensor getrennt). Abschalt-Checks (`_at_above_threshold()`): `None` statt Default bei unavailable → die WP wird **nie** auf einem Default-Wert abgeschaltet |
 | **VL-Fallback** | Letzter gültiger Vorlaufwert gecacht; PI pausiert bei fehlendem Cache |
-| **Einlass-Guard** | `_wp_inlet_temp()` → 0 wenn WP-Pumpe aus (verhindert Fehlausstieg durch veralteten Sensorwert). Ladeentscheidung + Hysterese nutzen `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: Flag `_buffer_fully_charged` über `_buffer_bottom()` (Puffer 1/4) — Einlass kühlt via Rohrverluste ab wenn Pumpe stoppt |
+| **Einlass-Guard** | `_wp_inlet_temp()` → 0 wenn WP-Pumpe aus (verhindert Fehlausstieg durch veralteten Sensorwert). Ladeentscheidung + Hysterese nutzen `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: Flag `_buffer_fully_charged` über `_buffer_mid()` (Puffer 1/2) — der 1/4-Fühler kühlt beim Entladen über den HK-Rücklauf ab, während 1/2 noch voll bleibt |
 | **Mindestlaufzeit buffer_charge** | Ausstieg per Temperatur erst nach 5 min; verhindert Fehlausstieg durch Rohrrestwasser (Sommerbetrieb) |
-| **Puffer-Hysterese-Restore** | `_buffer_fully_charged` wird in `initialize()` aus Puffer 1/4-Sensor wiederhergestellt — verhindert Sofort-Re-Ladezyklus nach AppDaemon-Neustart |
+| **Puffer-Hysterese-Restore** | `_buffer_fully_charged` wird in `initialize()` aus Puffer-1/2-Sensor wiederhergestellt (unbekannter Wert zählt als geladen) — verhindert Sofort-Re-Ladezyklus nach AppDaemon-Neustart |
 | **Neustart-Restore** | FSM-Zustand aus `input_select` nach AppDaemon-Neustart wiederhergestellt |
 | **Backup-/Startup-Grace** | Stoppt ein tägliches Backup alle Container, sind Sensoren beim AppDaemon-Neustart kurz `unavailable`. `_in_startup_grace()` unterdrückt alle WP-Abschalt-Transitionen (`heating→standby`, `heating_forced→standby`, `buffer_drain→idle`) für `startup_grace_seconds` (180 s); `initial_enter_delay_s` 5 → 30 s gibt Sensoren Zeit vor der ersten Transition |
 | **Kompressor-Restore** | `_compressor_on_since` ist In-Memory; `listen_state` feuert nicht für den bestehenden Zustand. `initialize()` liest `binary_sensor.kompressor_20004`: bei `on` → `now()` (frische Mindestlaufzeit), damit ein durchlaufender Verdichter nach Neustart nicht als „intern gestoppt" gilt und `heating→buffer_drain` die WP fälschlich stoppt |
@@ -307,6 +335,7 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | **Mischer Position-Erhalt** | `standby` und `hot_water` frieren Mischerposition ein (kein Fahrbefehl, Position in `_last_pi_position` gesichert). `idle` schließt als einziger Zustand aktiv. PI startet beim nächsten `heating`/`buffer_drain` von gespeicherter Position |
 | **Silent Mode** | Pauschal aktiv, Ausnahme `buffer_charge`/`buffer_charge_boost` (zügiges Laden) und ein `silent_mode_defrost_hold_h`-Fenster nach jedem Abtauende (schnellere Erholung, seltener Folge-Takt). Abgleich zentral in `_do_transition()` nach jedem Zustandswechsel — deckt auch Boost-Austritt ab, nicht nur den Eintritt. Beim AppDaemon-Start Sync mit dem aktuellen Zustand |
 | **Heizungs-Stillstand-Watchdog** | 60-s-Tick (`_check_heating_stall`): Bleibt der Kompressor in `heating`/`heating_forced` länger als `heating_stall_minutes` (Default 90 min) aus, während VL-Soll−Ist ≥ `heating_stall_error_c` (Default 2 °C) ist, liegt die Ursache außerhalb der FSM (z. B. Kreis 1 am Gerät deaktiviert, Fehlercode, Notbetrieb) — die FSM kann das nicht beheben, meldet es aber einmalig per persistenter HA-Benachrichtigung und Signal. Reset sobald der Kompressor wieder anspringt oder der Zustand wechselt |
+| **Abtauzyklen-Zähler** | Flanke `off→on` von `binary_sensor.abtauen_20005` erhöht zwei HA-Counter (`counter.hp_defrost_count`, `..._total`); ersterer täglich 00:00 per `run_daily` zurückgesetzt, letzterer läuft unbegrenzt als Basis für die Langzeitstatistik. Beide überleben AppDaemon-Neustarts (`restore: true`) |
 
 ---
 
@@ -315,7 +344,8 @@ In diesen Zuständen folgen Kreis 1 (40003) und Kreis 2 (40006) dem normalen Hei
 | Register | Typ | R/W | Beschreibung |
 |---|---|---|---|
 | 30003 | Input | R | Wassereinlass-Temp (Regelgröße bei 40002=1) |
-| 30004 | Input | R | Wasserauslass-Temp |
+| 30004 | Input | R | Wasserauslass-Temp (Bezug für Kreis 1 in `heating`/`heating_forced`) |
+| 30006 | Input | R | WW-Fühler (Einstieg/Austritt `hot_water`, Parameter `sensor_ww_temp`) |
 | 40002 | Holding | RW | Steuermethode: 0=Auslass, 1=Einlass |
 | 40003 | Holding | RW | Kreis-1-Sollwert (steuert WP-Verdichter) |
 | 40006 | Holding | RW | Kreis-2-Sollwert (Heizkörper-Vorlauf, via Mischer geregelt) |
@@ -398,7 +428,7 @@ All parameters are adjustable at runtime via the HA dashboard (`input_number.hp_
 | PV sensors | Instantaneous power (W) and daily remaining energy (kWh) in HA |
 
 **Hydraulic concept — two circuits:**
-- **Circuit 1** (Modbus 40003): internal heat pump control loop. In `heating` and `heating_forced` the FSM writes an LP-filtered outlet value + offset, preventing the HP's internal hysteresis (compressor stops when outlet > Circuit 1 + 4 °C) from triggering before the minimum runtime elapses. In `heating` there are two phases: Phase 1 (< 45 min) tracks the outlet bidirectionally (floor: heating curve); Phase 2 (≥ 45 min) Circuit 1 ramps down linearly at 1 °C/5 min toward the heating curve — the compressor stops naturally. When the compressor stops internally, Circuit 1 jumps immediately to `heating curve + circuit1_offset` for a clean start of the next cycle. In `buffer_drain`, `idle`, and `standby` Circuit 1 follows the heating curve normally. In `buffer_charge` the inlet target temperature is written instead.
+- **Circuit 1** (Modbus 40003): internal heat pump control loop, referenced to the LG outlet (Modbus 30004, no longer the Dallas contact sensor — which read ≈ 3.9 K lower). In `heating` and `heating_forced` the FSM writes an LP-filtered outlet value + `forced_setpoint_offset` (default **−3 °C**; with the switch to 30004 the sum of `forced_setpoint_offset` + `circuit1_offset` must stay ≤ 0, otherwise positive feedback — the FSM logs a warning at startup otherwise), preventing the HP's internal hysteresis (compressor stops when outlet > Circuit 1 + 4 °C) from triggering before the minimum runtime elapses. In `heating` there are three phases: **start mode** (compressor off, `heating_restart_pause_minutes` elapsed since the last OFF) sets Circuit 1 = buffer 1/4 + `heating_start_margin_c`, since the LG outlet reading is stale while idle and curve + 1 K sat too close to the water to get the HP started; Phase 1 (< 45 min, compressor running) tracks the outlet bidirectionally (floor: heating curve); Phase 2 (≥ 45 min **and** buffer 1/2 ≥ the `buffer_drain` OFF threshold) Circuit 1 ramps down linearly at 1 °C/10 min toward the heating curve — the compressor stops naturally (without the buffer condition the LG stopped just below the threshold in field testing, leaving the FSM stuck in `heating` unnecessarily). In `buffer_drain`, `idle`, and `standby` Circuit 1 follows the heating curve normally. In `buffer_charge` the inlet target temperature is written instead.
 - **Circuit 2** (Modbus 40006): house heating circuit with radiators. Supply temperature is regulated by the 3-way mixer (PI controller); the FSM writes the heating curve setpoint.
 
 ---
@@ -431,12 +461,17 @@ Parameter read chain: `HA input_number` → `apps.yaml` → `_DEFAULTS`.
 Top    ┌─────────────────────────┐  ← buffer_top     DHW zone (target: ww_target)
 3/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_mid_high
 1/2    ├═════════════════════════┤  ← buffer_mid     Supply connection · Heating ON/OFF + buffer_drain threshold
-1/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_bottom  Return zone · PV-charge pre-check only
+                                                       + PV-charge restart hysteresis
+1/4    ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  ← buffer_bottom  Return zone · PV-charge pre-check + heating start mode
 Bottom └─────────────────────────┘
 ```
 
-ON and OFF decision: 1/2 sensor (`buffer_mid`, supply connection height) — single switching point.
-The 1/4 sensor is the return zone (stays cold during heating) and only serves as a pump-independent pre-check for PV charging.
+ON and OFF decision: 1/2 sensor (`buffer_mid`, supply connection height) — single switching point,
+also used for the PV-charge restart hysteresis (previously 1/4, see below).
+The 1/4 sensor is the return zone (stays cold during heating) and serves as a pump-independent
+pre-check for PV charging as well as the target for the `heating` start mode (see Circuit 1 above).
+DHW entry/exit no longer depends on `buffer_top` but on the dedicated LG DHW sensor (Modbus 30006,
+`sensor_ww_temp`) — see below.
 
 ---
 
@@ -462,17 +497,24 @@ OAT cold, buffer warm:      idle → buffer_drain → heating → buffer_drain �
 OAT cold, buffer cold:      idle → heating → ...
 Compressor stops internally: heating → buffer_drain (buffer warm) → heating (buffer cold)
 Buffer 1/2 full:            heating → heating_forced / standby
-DHW window + buffer low:     (any state; standby after pause) → hot_water → standby
+DHW window + LG DHW sensor (30006) low:     (any state; standby after pause) → hot_water → standby
 PV surplus:                 idle/standby/buffer_drain → buffer_charge → [boost] → standby
 ```
 
 **DHW priority is conditional:** during the DHW window the FSM only switches to `hot_water`
-once the buffer top drops below `ww_target + ww_start_margin` — if it's still warm enough,
-the current state (e.g. `heating`) continues unchanged, avoiding an unnecessary interruption
-of the heating circuit. If the buffer only drops below the threshold during a `standby`
-pause, DHW starts once the pause ends. Once in `hot_water`, the FSM stays there until the
-window closes (no cycling back and forth). A sensor failure reads as `48 °C` → DHW mode as
-before (safe side).
+once the LG DHW sensor (Modbus 30006, parameter `sensor_ww_temp`) drops below
+`ww_target − ww_lg_hysteresis` — that's the LG's own switch-on point. Above it the LG won't
+charge anyway, so the current state (e.g. `heating`) continues unchanged, avoiding an
+unnecessary interruption of the heating circuit (previously decided from `buffer_top`; on
+2026-10-23 this caused an entry where the LG wasn't actually charging — 60 minutes without
+heating). If the sensor only drops below the threshold during a `standby` pause, DHW starts
+once the pause ends. **Exit:** 30006 ≥ `ww_target`, or the window closes (no cycling back and
+forth while inside it). Sensor failure (30006 unknown) → DHW mode as before (safe side), but
+no automatic exit via target temperature — only window end or the time limit apply then.
+
+**Manually forced DHW** (`force_state`/`input_select`, also outside the window): the FSM stays
+in `hot_water` until 30006 ≥ `ww_target`, at the latest after `hw_manual_max_min` (default
+60 min), or until the state is left manually. The flag is lost on an AppDaemon restart.
 
 #### buffer_drain / heating thresholds (dynamic)
 
@@ -557,6 +599,16 @@ exit in summer mode: the HP's internal pump reads hot residual pipe water from t
 cycle immediately on start — without a minimum runtime the exit condition would wrongly
 fire after a few seconds.
 
+PV charging also only starts at instantaneous PV power ≥ `pv_charge_min_w` (default 2000 W) —
+the forecast alone (`pv_buffer_min_kwh`) started a charge on 2026-10-23 with only 0.7 kW
+instantaneous power, drawing on grid power.
+
+**Restart hysteresis after charging** (`buffer_charge_hyst`, default 5 °C): after shutdown
+(`_buffer_fully_charged = True`), the next charge only starts once **buffer 1/2** — not
+buffer 1/4 — drops below `buffer_charge_inlet_temp − buffer_charge_hyst`. The 1/4 sensor cools
+by 5 K within ~25 min via the heating-circuit return flow while draining, while buffer 1/2
+stays full, which reset the hysteresis prematurely.
+
 **Heating-rod boost — start and exit protection:** PV must stay continuously ≥
 `boost_pv_min_w` for `boost_pv_stable_minutes` (default 15 min) before boost starts —
 prevents short boosts (< 1 min) from brief PV spikes at the end of `buffer_charge`. Once
@@ -602,6 +654,8 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 |---|---|---|
 | `hp_buffer_drain_margin` | 3 °C | ON-threshold margin above heating curve |
 | `hp_buffer_drain_hyst` | 2 °C | Dead band between ON and OFF |
+| `pv_charge_min_w` | 2000 W | PV charging only starts at instantaneous power ≥ x (not forecast alone) |
+| `buffer_charge_hyst` | 5 °C | Restart hysteresis after charging, referenced to buffer 1/2 |
 
 #### Mixer: Feedforward + Trim
 | Parameter | Default | Description |
@@ -625,7 +679,8 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 #### DHW & silent mode
 | Parameter | Default | Description |
 |---|---|---|
-| `ww_start_margin` | 1.0 °C | DHW mode in the DHW window only once buffer top < `ww_target` + x |
+| `ww_lg_hysteresis` | 1.0 °C | DHW mode in the DHW window only once 30006 < `ww_target` − x (= LG switch-on point) |
+| `hw_manual_max_min` | 60 min | Manually forced DHW: time limit if `ww_target` is never reached |
 | `silent_mode_defrost_hold_h` | 2 h | Silent mode disabled for this long after defrost ends |
 
 #### Heating-rod boost
@@ -645,8 +700,10 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 |---|---|---|
 | `hp_min_runtime_minutes` | 45 min | Minimum compressor runtime |
 | `hp_standby_minutes` | 3 min | Protective pause between cycles |
-| `hp_forced_setpoint_offset` | 1 °C | Circuit 1 offset above LP value (used in both `heating` and `heating_forced`) |
+| `hp_forced_setpoint_offset` | −3 °C | Circuit 1 offset above LP value (used in both `heating` and `heating_forced`), referenced to the LG outlet (30004); sum with `circuit1_offset` must stay ≤ 0 |
 | `hp_forced_lp_alpha` | 0.2 | LP filter alpha for WP outlet (used in both `heating` and `heating_forced`) |
+| `heating_start_margin_c` | 3 °C | `heating` start mode: Circuit 1 = buffer 1/4 + this margin, so the LG actually starts |
+| `heating_restart_pause_minutes` | 10 min | After an internal compressor OFF in `heating`, no start mode for this long (Circuit 1 keeps tracking) |
 | `hp_cycling_window_minutes` | 60 min | Cycling protection: observation window |
 | `hp_cycling_max_starts` | 6 | Cycling protection: max starts → dry-run |
 
@@ -661,8 +718,8 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | **Dry-run** | FSM fully active, no Modbus/cover write; hardware sync on deactivation |
 | **OAT fallback (asymmetric)** | Turn-on checks: startup default 30 °C (no heating demand), last valid OAT cached for both EMA and 1h sensors. Turn-off checks (`_at_above_threshold()`): `None` instead of a default when unavailable → the heat pump is **never** switched off on a default value |
 | **Flow temp fallback** | Last valid flow temp cached; PI pauses if no cache (startup) |
-| **Inlet guard** | `_wp_inlet_temp()` → 0 when WP pump off (prevents false exit from stale sensor). Charge decision + hysteresis use `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: `_buffer_fully_charged` set via `_buffer_bottom()` (buffer 1/4) — inlet cools via pipe losses when pump stops |
-| **Buffer hysteresis restore** | `_buffer_fully_charged` restored in `initialize()` from buffer 1/4 sensor — prevents immediate re-charge cycle after AppDaemon restart |
+| **Inlet guard** | `_wp_inlet_temp()` → 0 when WP pump off (prevents false exit from stale sensor). Charge decision + hysteresis use `_raw_inlet_temp()`. `on_exit_buffer_charge/boost`: `_buffer_fully_charged` set via `_buffer_mid()` (buffer 1/2) — the 1/4 sensor cools via the heating-circuit return flow while draining, while 1/2 stays full |
+| **Buffer hysteresis restore** | `_buffer_fully_charged` restored in `initialize()` from the buffer 1/2 sensor (unknown value counts as charged) — prevents immediate re-charge cycle after AppDaemon restart |
 | **Restart restore** | FSM state restored from `input_select` after AppDaemon restart |
 | **Backup / startup grace** | When a daily backup stops all containers, sensors are briefly `unavailable` after the AppDaemon restart. `_in_startup_grace()` suppresses all heat-pump-off transitions (`heating→standby`, `heating_forced→standby`, `buffer_drain→idle`) for `startup_grace_seconds` (180 s); `initial_enter_delay_s` raised 5 → 30 s gives sensors time before the first transition |
 | **Compressor restore** | `_compressor_on_since` is in-memory; `listen_state` does not fire for the pre-existing state. `initialize()` reads `binary_sensor.kompressor_20004`: if `on` → `now()` (fresh minimum runtime), so a compressor running through the restart is not treated as "internally stopped" and `heating→buffer_drain` cannot wrongly stop the heat pump |
@@ -671,6 +728,7 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | **Mixer position retention** | `standby` and `hot_water` freeze the mixer position (no travel command, position saved in `_last_pi_position`). `idle` is the only state that actively closes the mixer. PI resumes from the saved position on next `heating`/`buffer_drain` |
 | **Silent mode** | On by default, except `buffer_charge`/`buffer_charge_boost` (fast charging) and a `silent_mode_defrost_hold_h` window after each defrost ends (faster recovery, fewer follow-up cycles). Reconciled centrally in `_do_transition()` after every state change — also covers boost exit, not just entry. Synced with the current state on AppDaemon start |
 | **Heating-stall watchdog** | 60 s tick (`_check_heating_stall`): if the compressor stays off in `heating`/`heating_forced` for longer than `heating_stall_minutes` (default 90 min) while setpoint−actual flow temp ≥ `heating_stall_error_c` (default 2 °C), the cause lies outside the FSM (e.g. circuit 1 disabled on the unit, error code, emergency mode) — the FSM cannot fix it but reports it once via a persistent HA notification and Signal. Resets once the compressor runs again or the state changes |
+| **Defrost cycle counter** | A rising edge (`off→on`) of `binary_sensor.abtauen_20005` increments two HA counters (`counter.hp_defrost_count`, `..._total`); the former is reset daily at 00:00 via `run_daily`, the latter runs unbounded as the basis for long-term statistics. Both survive AppDaemon restarts (`restore: true`) |
 
 ---
 
@@ -679,7 +737,8 @@ In these states both Circuit 1 (40003) and Circuit 2 (40006) track the heating c
 | Register | Type | R/W | Description |
 |---|---|---|---|
 | 30003 | Input | R | Water inlet temp (control variable for 40002=1) |
-| 30004 | Input | R | Water outlet temp |
+| 30004 | Input | R | Water outlet temp (reference for Circuit 1 in `heating`/`heating_forced`) |
+| 30006 | Input | R | DHW sensor (entry/exit of `hot_water`, parameter `sensor_ww_temp`) |
 | 40002 | Holding | RW | Control method: 0=outlet, 1=inlet |
 | 40003 | Holding | RW | Circuit 1 setpoint (controls compressor) |
 | 40006 | Holding | RW | Circuit 2 setpoint (radiator supply, regulated by mixer) |

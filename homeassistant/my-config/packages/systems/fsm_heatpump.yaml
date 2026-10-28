@@ -17,6 +17,22 @@ fsm_heatpump:
       sampling_size: 120
       precision: 1
 
+  # ── Abtauzyklen-Zaehler ────────────────────────────────────────────────────────
+  # Zaehlt Flanken off->on von binary_sensor.abtauen_20005 (FSM: _on_defrost_start).
+  # Taeglich 00:00 von der FSM zurueckgesetzt (_reset_defrost_counter).
+  counter:
+    hp_defrost_count:
+      name: "Abtauzyklen heute"
+      icon: mdi:snowflake-melt
+      restore: true
+    # Nie zurueckgesetzt (kein run_daily-Reset in der FSM) - Basis fuer die
+    # Langzeitstatistik unten. counter.* selbst landet nicht in den HA-Statistics
+    # (kein state_class moeglich), daher der Umweg ueber den Template-Sensor.
+    hp_defrost_count_total:
+      name: "Abtauzyklen gesamt (roh)"
+      icon: mdi:snowflake-melt
+      restore: true
+
   input_number:
     # ── Heizkurve ──────────────────────────────────────────────────────────────
     hp_heat_curve_at_high:
@@ -199,10 +215,9 @@ fsm_heatpump:
       unit_of_measurement: "°C"
       icon: mdi:thermometer-minus
       mode: slider
-      # Neustart der Pufferladung erst wenn Einlass unter
+      # Neustart der Pufferladung erst wenn Puffer 1/2 unter
       # (hp_buffer_charge_inlet_temp - hp_buffer_charge_hyst) faellt.
-      # Verhindert Takt-Neustart wenn Einlass nach WP-Stopp knapp
-      # unter die Zieltemperatur faellt (z.B. 49.4 < 50°C).
+      # Nicht Puffer 1/4: kuehlt beim Entladen durch den HK-Ruecklauf schnell ab.
 
     hp_boost_pv_min_w:
       name: "Boost PV-Mindestleistung (EIN)"
@@ -375,9 +390,12 @@ fsm_heatpump:
       icon: mdi:counter
       mode: slider
 
+    # Kreis-1-Offset zum LG-Auslass 30004 (seit 16.10. Bezug, vorher Dallas ≈ 3.9 K tiefer).
+    # Sollwert −3.0: Kreis 1 ≈ Auslass − 2 K. Summe mit hp_circuit1_offset muss < 0 bleiben,
+    # sonst Mitkopplung. Kein initial: (würde den gespeicherten Wert überschreiben).
     hp_forced_setpoint_offset:
       name: "Mindestlaufzeit Sollwert-Offset"
-      min: 0.0
+      min: -5.0
       max: 5.0
       step: 0.5
       unit_of_measurement: "°C"
@@ -561,6 +579,16 @@ fsm_heatpump:
             {% else %}
               unavailable
             {% endif %}
+
+        - name: "Abtauzyklen gesamt"
+          unique_id: fsm_sensor_abtauzyklen_gesamt
+          icon: mdi:snowflake-melt
+          state_class: total_increasing
+          # Spiegelt counter.hp_defrost_count_total als sensor, damit die
+          # Langzeitstatistik (ueberlebt die ~10 Tage Recorder-Retention) greift -
+          # counter.* selbst hat keinen state_class und wird nicht statistisch erfasst.
+          state: >
+            {{ states('counter.hp_defrost_count_total') | int(0) }}
 
         - name: "Außentemperatur EMA"
           unique_id: fsm_sensor_at_ema

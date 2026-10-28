@@ -205,6 +205,12 @@ views:
           - entity: binary_sensor.abtauen_20005
             name: Abtauen
             icon: mdi:snowflake-melt
+          - entity: counter.hp_defrost_count
+            name: Abtauzyklen heute
+            icon: mdi:snowflake-melt
+          - entity: sensor.abtauzyklen_gesamt
+            name: Abtauzyklen gesamt
+            icon: mdi:snowflake-melt
           - entity: binary_sensor.zusatzheizung_1_20011
             name: Heizstab Stufe 1 (3 kW)
             icon: mdi:heating-coil
@@ -375,7 +381,7 @@ views:
           - entity: input_number.hp_pv_buffer_max_kwh
             name: PV-Restmenge unter
             mode: slider
-          - entity: sensor.energy_production_today_remaining
+          - entity: sensor.pv_energy_production_today_remaining
             name: PV-Restmenge (Prognose)
             icon: mdi:solar-power-variant
       - type: entities

@@ -542,6 +542,7 @@ lgthermav:
           unique_id: lgthermav_sensor_warmeleistung
           unit_of_measurement: "W"
           device_class: power
+          state_class: measurement
           availability: >
             {{ is_state('binary_sensor.kompressor_20004', 'on') 
               and is_state('binary_sensor.wasserdurchfluss_20001', 'on') }}
@@ -556,6 +557,47 @@ lgthermav:
               0
             {% endif %}
 
+        # Bilanz-Variante für die Energiezählung (WP-QS / JAZ): vorzeichenrichtig
+        # (Abtauen entzieht dem Heizkreis Wärme → negativ) und 0 statt unavailable,
+        # wenn der Verdichter steht – sonst lückenhafte Integration.
+        - name: "WP Wärmeleistung Bilanz"
+          unique_id: lgthermav_sensor_warmeleistung_bilanz
+          unit_of_measurement: "W"
+          device_class: power
+          state_class: measurement
+          state: >
+            {% set ein = states('sensor.wassereinlasstemperatur_30003') %}
+            {% set aus = states('sensor.wasserauslasstemperatur_30004') %}
+            {% set f = states('sensor.durchflussrate_30009')|float(0) %}
+            {% set cp = states('sensor.iapws95_dichte')|float(0) * states('sensor.iapws95_warmekapazitat_cp')|float(0) / 60 %}
+            {% if is_state('binary_sensor.kompressor_20004', 'on')
+                  and is_state('binary_sensor.wasserdurchfluss_20001', 'on')
+                  and f > 0 and ein|is_number and aus|is_number %}
+              {{ (cp * (aus|float - ein|float) * f)|round(1) }}
+            {% else %}
+              0
+            {% endif %}
+
+        # Gütegrad nach Fraunhofer ISE (WP-QS 2025, Kap. 6.7): Carnot-COP wasserseitig,
+        # T_Senke = Mittel Ein-/Auslass, T_Quelle = Außenluft an der WP.
+        # Vergleich: Luft/Wasser-WP Ø 0.39 (0.32–0.44). Momentanwert – für Vergleiche
+        # energiegewichtet über wpqs_kpi.sh auswerten.
+        - name: "WP Gütegrad ISE"
+          unique_id: lgthermav_sensor_guetegrad_ise
+          state_class: measurement
+          availability: >
+            {% set ein = states('sensor.wassereinlasstemperatur_30003') %}
+            {% set aus = states('sensor.wasserauslasstemperatur_30004') %}
+            {% set at = states('sensor.aussenlufttemperatur_30013') %}
+            {{ states('sensor.wp_arbeitszahl')|is_number
+               and ein|is_number and aus|is_number and at|is_number
+               and ((ein|float + aus|float) / 2 - at|float) >= 5 }}
+          state: >
+            {% set tm = (states('sensor.wassereinlasstemperatur_30003')|float
+                         + states('sensor.wasserauslasstemperatur_30004')|float) / 2 %}
+            {% set at = states('sensor.aussenlufttemperatur_30013')|float %}
+            {{ (states('sensor.wp_arbeitszahl')|float / ((tm + 273.15) / (tm - at)))|round(3) }}
+
         - name: "WP Arbeitszahl"
           unique_id: lgthermav_sensor_arbeitszahl
           unit_of_measurement: "W(th)/W(el)"
@@ -568,6 +610,9 @@ lgthermav:
             {% set therm = states('sensor.wp_warmeleistung')|float(0) %}
             {{ (therm / el)|round(2) }}
 
+        # Kältemittelseitig (Heißgas statt Kondensationstemperatur) → Hub zu groß,
+        # Carnot-COP zu klein, Effizienz zu hoch. Nicht mit ISE-Werten vergleichbar,
+        # dafür "WP Gütegrad ISE" nutzen.
         - name: "Carnot-COP"
           unique_id: lgthermav_sensor_carnot_cop
           unit_of_measurement: "Eta"
@@ -848,6 +893,30 @@ lgthermav:
     - platform: average
       name: "Carnot-Effizienz (1d)"
       unique_id: avg_carnot_effizienz_1d
-      duration: 01:00:00
+      duration: 24:00:00
       entities:
         - sensor.carnot_effizienz
+
+    # Energiezähler für JAZ/Heizlast (WP-QS). Landen in der Langzeitstatistik
+    # (statistics) und überleben damit die Recorder-Retention.
+    - platform: integration
+      name: "WP Wärme Energie"
+      unique_id: wp_waerme_energie
+      source: sensor.wp_warmeleistung_bilanz
+      unit_prefix: k
+      round: 3
+      method: left
+      max_sub_interval:
+        minutes: 5
+
+    # unit_prefix k setzt eine Quelle in W voraus; liefert der Zähler kW,
+    # unit_prefix entfernen (sonst "kkWh").
+    - platform: integration
+      name: "WP Strom Energie"
+      unique_id: wp_strom_energie
+      source: sensor.energiezahler_it_schaltschrank_leistung_warmepumpe
+      unit_prefix: k
+      round: 3
+      method: left
+      max_sub_interval:
+        minutes: 5

@@ -18,16 +18,20 @@ heatpump_fsm:
   sensor_outdoor_temp:    sensor.aussentemperatur_ema
   sensor_outdoor_temp_1h: sensor.aussentemperatur_mittelwert_1h
   sensor_pv_power_w:      sensor.pv_produktion_15m
-  sensor_pv_energy_kwh:   sensor.energy_production_today_remaining
+  sensor_pv_energy_kwh:   sensor.pv_energy_production_today_remaining
   sensor_flow_temp:       sensor.hp_temp_sensors_2036e1_heizung_vl
   sensor_return_temp:     sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
   # Heizkreis-Ruecklauf (Kalt-Eingang des Mischers) - Mischer-Feedforward (T_RL)
   sensor_mixer_return_temp: sensor.hp_temp_sensors_2036e1_heizung_rl
-  sensor_wp_leaving_temp: sensor.hp_temp_sensors_2036e1_hydrobox_auslauf_zu_tank
+  # LG-Auslass (Modbus 30004) statt Dallas-Anlegefühler: die LG schaltet nach diesem Fühler ab
+  # (Auslass > Kreis 1 + 4 °C); der Dallas lag ≈ 3.9 K tiefer (WP-QS-Baseline 16.10.)
+  sensor_wp_leaving_temp: sensor.wasserauslasstemperatur_30004
   sensor_buffer_bottom:   sensor.hp_temp_sensors_2036e1_tank_1_4
   sensor_buffer_mid:      sensor.hp_temp_sensors_2036e1_tank_2_4
   sensor_buffer_mid_high: sensor.hp_temp_sensors_2036e1_tank_3_4
   sensor_buffer_top:      sensor.hp_temp_sensors_2036e1_tank_4_4
+  # LG-WW-Fuehler (Modbus 30006): WW-Einstieg/-Ende, die LG laedt nach diesem Fuehler
+  sensor_ww_temp:         sensor.temperatur_pufferspeicher_30006
   # Wassereinlass WP (Modbus 30003) - Regelgroesse bei 40002=1 (Einlass-Regelung)
   sensor_wp_inlet_temp:   sensor.wassereinlasstemperatur_30003
 
@@ -44,6 +48,8 @@ heatpump_fsm:
   binary_compressor:        binary_sensor.kompressor_20004
   binary_wp_pump:           binary_sensor.umwalzpumpe_20002
   binary_defrost:           binary_sensor.abtauen_20005
+  counter_defrost:          counter.hp_defrost_count
+  counter_defrost_total:    counter.hp_defrost_count_total
   binary_aux_heater_1:      binary_sensor.zusatzheizung_1_20011
   binary_aux_heater_2:      binary_sensor.zusatzheizung_2_20012
   binary_werktag:           binary_sensor.werktag
@@ -82,9 +88,11 @@ heatpump_fsm:
   setpoint_tau_s:           45    # Sollwert-Glaettung, zeitbasiert (s)
 
   # ── Warmwasser ──────────────────────────────────────────────
-  # WW-Modus im WW-Fenster erst wenn Puffer oben < ww_target + x (°C);
-  # darueber bleibt der aktuelle Zustand (z.B. heating) erhalten.
-  ww_start_margin:          1.0
+  # WW-Einschaltdifferenz der LG (LG-UI, auf 30006): WW-Modus im Fenster erst bei
+  # 30006 < ww_target - x (°C), darueber laedt die LG nicht und der Zustand bleibt.
+  ww_lg_hysteresis:         1.0
+  # Manuell erzwungenes WW: Zeitlimit (min), falls ww_target nie erreicht wird
+  hw_manual_max_min:        60
 
   # ── Neustart-Schutz (Backup ~02:05) ─────────────────────────
   # Nach (Neu-)Start: HA-Services-Delay vor erster Transition-Pruefung,
