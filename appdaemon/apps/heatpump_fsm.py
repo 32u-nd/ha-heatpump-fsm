@@ -1,0 +1,3317 @@
+# Revision: 35 · 2026-11-20 07:47
+"""
+heatpump_fsm.py - Waermepumpen-FSM auf Basis von FSMBase
+========================================================
+Konfiguriert fuer: LG ThermaV mit Modbus, 4-Sensor-Pufferspeicher,
+                  3-Wege-Mischer mit Motorlaufzeit-Steuerung (PI-Regler),
+                  Grundfos Heizkreispumpe (Kreis 2)
+
+═══════════════════════════════════════════════════════════════════
+PUFFERSPEICHER-ZONENKONZEPT
+═══════════════════════════════════════════════════════════════════
+  Oben  ┌-----------------------------┐  ← sensor_buffer_top   (oben)
+        │  WW-Zone                    │    WW-Ziel: ww_target (z.B. 52°C), AUS wenn ≥ Ziel
+        │                             │
+  3/4   ├ - - - - - - - - - - - - - - │  ← sensor_buffer_mid_high (3/4)
+        │                             │    PV-Ladung: Einlass < buffer_charge_inlet_temp
+        │                             │               (40002=1: WP regelt auf Einlass 30003)
+        │                             │    Boost:     Einlass < boost_inlet_temp
+  1/2   ├=============================│  ← sensor_buffer_mid   (1/2)  ← Vorlauf-Stutzen
+        │  Heizzone (einfach)         │    Heizung EIN  wenn 1/2 < Sollwert + buffer_drain_margin
+        │  leichte Durchmischung      │    Heizung AUS  wenn 1/2 >= Sollwert + margin + hyst
+  1/4   ├ - - - - - - - - - - - - - - │  ← sensor_buffer_bottom (1/4)
+        │                             │    buffer_drain EIN wenn 1/2 >= Sollwert + margin + hyst
+        │                             │    (1/4 = Ruecklaufzone, nur Vorcheck bei PV-Ladung)
+  Unten └-----------------------------┘
+
+  Heizzone ist UNGETEILT (1/4 bis 1/2). Vorlauf-Stutzen auf Hoehe 1/2.
+  EIN- und AUS-Entscheidung beide am 1/2-Sensor (Vorlauf-Hoehe, direkter
+  Bezug zum Heizkreis). 1/4 (Ruecklaufzone) bleibt waehrend Heizkreislauf
+  naturgemaess kalt und taugt nicht als Schaltpunkt - dient nur als
+  pumpenunabhaengiger Vorcheck in _should_charge_buffer.
+  WW-Zone ist OBEN - WP laedt von unten hoch, Schichtung bleibt erhalten.
+
+═══════════════════════════════════════════════════════════════════
+MISCHER (3-Wege, ESPHome time_based cover)
+═══════════════════════════════════════════════════════════════════
+  cover.lg_thermav_circuit_2_1e6134_rl_mischer
+  100% = Vorlauf kommt vollstaendig aus Pufferspeicher (heiss)
+  0%   = Vorlauf ist vollstaendig Ruecklauf (kalt)
+  Laufzeit: 123s (+ 2s Ueberfahren bei Endpositionen)
+
+═══════════════════════════════════════════════════════════════════
+GRUNDFOS PUMPE (Heizkreis 2)
+═══════════════════════════════════════════════════════════════════
+  EIN:  heating, heating_forced, buffer_drain
+        buffer_charge / buffer_charge_boost: EIN nur wenn AT < heating_threshold
+        (Parallelheizung im Winter, AUS im Sommer via _update_charge_heating)
+  AUS:  idle, standby, hot_water
+        buffer_charge / buffer_charge_boost bei AT >= heating_threshold
+
+═══════════════════════════════════════════════════════════════════
+MISCHER PI-REGLER (velocity-form)
+═══════════════════════════════════════════════════════════════════
+  Aktiv in: heating, heating_forced, buffer_drain,
+            buffer_charge / buffer_charge_boost (wenn AT < heating_threshold)
+  Formel:   delta = kp*(e - e_prev) + ki*e   (velocity-form, kein Integral-Akkumulator)
+  Step-Limit: delta wird auf ±mixer_max_step_pct (~4%) geclampt
+              (verhindert Ueberschwingen bei 123s-Stellantrieb, 5s-Takt)
+  Anti-Windup: implizit durch Position-Clamp (0–100%) und Step-Limit
+  Sensor-Cache: letzter gueltiger VL-Wert wird gehalten bei Sensorausfall;
+                PI pausiert nur wenn noch kein Cache vorhanden (Startup).
+
+═══════════════════════════════════════════════════════════════════
+ZUSTAENDE
+═══════════════════════════════════════════════════════════════════
+  idle                -> WP aus, Mischer geschlossen, Pumpe AUS
+                         Nur wenn AT >= heating_threshold (keine Heizanforderung)
+
+  heating             -> Heizbetrieb nach Heizkurve, WP EIN, Mischer PI-Regler, Pumpe EIN
+                         EIN:  AT < heating_threshold UND Puffer 1/2 < threshold_on
+                         AUS:  Puffer 1/2 >= threshold_off (= threshold_on + buffer_drain_hyst)
+                               ODER AT >= heating_threshold
+
+  heating_forced      -> Verdichterschutz-Mindestlaufzeit, WP EIN, Mischer PI-Regler, Pumpe EIN
+                         Einstieg: heating beendet, Kompressor lief < min_runtime_minutes
+                                   UND Kompressor war tatsaechlich an (_compressor_on_since != None)
+                         Kreis 1 (40003): EWMA(WP-Ausgang) + forced_setpoint_offset + Kreis1-Offset
+                                          Hard-Limit: heat_curve_vl_low (Max-Auslegung WP)
+                                          Ratchet: steigt nur, faellt nicht waehrend Mindestlaufzeit
+                         Kreis 2 (40006): normaler Heizkurven-Sollwert (kein Einfluss auf WP-Regelung)
+                         Austritt (Zeit abgelaufen + Heizbedarf):    -> heating (Kreis1 Ramp-Down -1°C/min)
+                         Austritt (Zeit abgelaufen + kein Heizbedarf): -> standby
+                         Neustart-Restore: Timer sofort abgelaufen (_forced_end_time = now())
+
+  hot_water           -> Warmwasser-Vorrang, WP EIN (WW-Modus), Pumpe AUS
+                         Einstieg: WW-Fenster aktiv UND LG-WW-Fuehler 30006 < ww_target - ww_lg_hysteresis
+                                   (darueber laedt die LG nicht -> Zustand bleibt, kein WW-Modus)
+                         Austritt: 30006 >= ww_target -> standby (auch nach Fensterende),
+                                   Zeitlimit hw_window_max_min, Fensterende nur bei 30006 unbekannt
+                         Manuell erzwungen (force_state/input_select, auch ausserhalb des Fensters):
+                         _hw_manual=True, Austritt bei 30006 >= ww_target, nach hw_manual_max_min oder manuellem
+                         Verlassen (on_exit loescht das Flag); Flag geht beim Neustart verloren
+
+  buffer_charge       -> PV-Ueberschuss laedt Puffer, WP EIN, 40002=1 (Einlass-Regelung)
+                         Pumpe/Mischer: AT-abhaengig via _update_charge_heating
+                         Einlass-Ziel: buffer_charge_inlet_temp (50°C) auf Sensor 30003
+                         Exit: Einlass >= 50°C (Puffer voll) ODER PV zu schwach
+
+  buffer_charge_boost -> PV + Heizstab (40010=boost_energy_state), 40002=1 bleibt
+                         Pumpe/Mischer: AT-abhaengig via _update_charge_heating
+                         Einlass-Ziel: boost_inlet_temp (55°C)
+                         Startet wenn: PV >= boost_pv_min_w UND Einlass >= boost_inlet_min_c (45°C)
+                         Exit: Einlass >= boost_inlet_temp ODER PV zu schwach
+
+  buffer_drain        -> Puffer heizt Haus direkt, WP AUS, Mischer PI-Regler, Pumpe EIN
+                         EIN:  AT < heating_threshold UND Puffer 1/2 >= threshold_off
+                               (threshold_off = threshold_on + buffer_drain_hyst)
+                         AUS:  Puffer 1/2 < threshold_on     -> heating
+                               AT >= heating_threshold + heating_hyst -> idle
+                               WW / PV-Vorrang
+
+  standby             -> Verdichterschutz-Pause nach WP-Lauf, Pumpe AUS
+                         Dauer: standby_minutes
+
+  buffer_drain/heating Schwellen:
+    threshold_on  = _calc_flow_setpoint(ohne PV-Korrektur) + buffer_drain_margin
+    threshold_off = threshold_on + buffer_drain_hyst
+    Kein PV-Anteil in den Schwellen (verhindert PV-Jitter-Takt)
+
+═══════════════════════════════════════════════════════════════════
+ZUSTANDSUEBERGAENGE (vereinfacht)
+═══════════════════════════════════════════════════════════════════
+
+  AT kalt + Puffer warm:   idle / standby --> buffer_drain --> heating
+                                                                   │
+  AT kalt + Puffer kalt:   idle / standby ----------------------> heating
+                                                                   │
+  Puffer 1/2 voll:         heating -----------------------------> heating_forced / standby
+  Komp. intern gestoppt:   heating -----------------------------> buffer_drain (wenn Puffer warm genug)
+  WW-Fenster + 30006 < ww_target - ww_lg_hysteresis:
+                           (jeder Zustand; standby nach Pause) -> hot_water
+  PV-Ueberschuss:           idle / standby / buffer_drain --------> buffer_charge
+
+  buffer_drain -> idle:
+    Einstieg bei AT < heating_threshold UND Puffer 1/2 >= threshold_off
+    Austritt  bei AT >= heating_threshold UND Puffer 1/2 < threshold_off
+
+═══════════════════════════════════════════════════════════════════
+SCHUTZMECHANISMEN
+═══════════════════════════════════════════════════════════════════
+  E-Stop (fsm_base):
+    > estop_max_transitions Wechsel in estop_window_seconds ->
+    -> Dry-Run + HA persistent_notification
+
+  Verdichter-Takt-Schutz (_check_compressor_cycling):
+    > cycling_max_starts Starts in cycling_window_minutes ->
+    -> Dry-Run + HA persistent_notification
+    Frühwarnung bei max_starts - 2
+
+  Neustart-Retention:
+    FSM-Zustand aus input_select wiederhergestellt.
+    heating_forced: _forced_end_time = now() (Timer sofort abgelaufen nach Neustart)
+    _initial_enter_done Guard verhindert doppelten on_enter-Aufruf.
+
+  Sensor-Fallback:
+    AT: letzter gueltiger Wert gecacht; Startup-Default 30°C (kein Heizbedarf)
+    VL: letzter gueltiger Wert gecacht; PI pausiert bei Startup ohne Cache
+    _compressor_on_since = None -> kein heating_forced (kein Verdichter zu schuetzen)
+
+═══════════════════════════════════════════════════════════════════
+DRY-RUN MODUS (Simulation)
+═══════════════════════════════════════════════════════════════════
+  input_boolean.hp_dry_run = EIN -> FSM rechnet, kein Modbus/Cover-Write
+"""
+
+from fsm_base import FSMBase, Transition
+import collections
+import datetime
+import math
+import os
+
+
+class HeatpumpFSM(FSMBase):
+
+    # -- Fallback-Standardwerte ------------------------------------------------
+    _DEFAULTS = {
+        "heat_curve_at_high": 16.0,
+        "heat_curve_vl_high": 27.0,
+        "heat_curve_at_low": -15.0,
+        "heat_curve_vl_low": 40.0,
+        "pv_correction_per_kw": 0.2,
+        "buffer_drain_margin": 1.5,
+        "buffer_drain_hyst": 2.0,
+        "ww_target_temp": 51.0,
+        # WW-Einschaltdifferenz der LG (LG-UI) auf 30006: die LG laedt erst bei
+        # 30006 < ww_target - x. Darueber bleibt der aktuelle Zustand (z.B. heating).
+        "ww_lg_hysteresis": 1.0,
+        # Manuell erzwungenes WW: Abbruch nach max. x min (Ziel evtl. nie erreicht)
+        "hw_manual_max_min": 60,
+        # WW aus dem Fenster: läuft über das Fensterende hinaus bis 30006 >= Ziel,
+        # Abbruch spätestens nach x min im Zustand hot_water
+        "hw_window_max_min": 90,
+        "pv_buffer_min_kwh": 5.0,
+        "hw_morning_weekday_h": 5,
+        "hw_morning_weekday_m": 30,
+        "hw_morning_weekend_h": 6,
+        "hw_morning_weekend_m": 30,
+        "hw_evening_h": 21,
+        "hw_evening_m": 0,
+        "hw_duration_minutes": 60,
+        # Mischer: Feedforward (invertierte Mischgleichung) + langsamer PI-Trim.
+        # kp/ki sind jetzt der TRIM-Regler auf das Residuum (FF leistet den Grundhub).
+        "mixer_kp": 0.4,          # Trim-Proportional %/°C (war 0.5 voller PI)
+        "mixer_ki": 0.01,         # Trim-Integral %/°C/Zyklus -> T_i = kp*Ts/ki = 200s
+        "mixer_interval_s": 5.0,
+        "mixer_max_step_pct": 4.0,
+        "mixer_warmstart_position": 20.0,
+        "mixer_dt_min": 2.0,            # Untergrenze (T_Tank-T_RL) im FF-Nenner (kein Sprung, nur Regularisierung)
+        "mixer_trim_limit_pct": 15.0,  # max. |Trim| um den FF-Arbeitspunkt
+        # Mischer-Schonung (Stellantrieb-Lebensdauer): weniger, groessere Fahrten
+        "mixer_error_db_c": 0.5,        # Totband Soll-Ist Kreis 2 fuer den Trim [°C]
+        "mixer_move_db_pct": 3.0,       # Fahrbefehl erst ab |Ideal-Ist| >= x %pt
+        "mixer_min_move_s": 60.0,       # Mindestabstand zwischen zwei Fahrbefehlen [s]
+        "mixer_big_move_pct": 10.0,     # ab dieser Abweichung gilt der Mindestabstand nicht
+        "mixer_sensor_tau_s": 60.0,     # Tiefpass Tank-/RL-Fuehler im FF (0 = aus) [s]
+        "mixer_start_hold_s": 180.0,    # nach Pumpenstart: so lange Position halten (RL-Fuehler veraltet) [s]
+        "mixer_trim_init_max_pct": 8.0, # max. Trim-Vorbelegung beim (bumpless) Start [%pt]
+        "pv_smooth_minutes": 60.0,      # PV-Korrektur: Zeitkonstante der zusaetzlichen Glaettung [min]
+        "min_runtime_minutes": 45.0,
+        "standby_minutes": 3.0,
+        # Bezug: LG-Auslass 30004 (sensor_wp_leaving_temp). Negativ = Kreis 1 liegt unter dem
+        # Auslass, LG regelt eher ab; mit circuit1_offset 1.0 → Kreis 1 ≈ Auslass − 2 K,
+        # LG-Stopp erst bei Auslass > Kreis 1 + 4. Positive Summe beider Offsets → Mitkopplung.
+        "forced_setpoint_offset": -3.0,
+        "forced_lp_alpha": 0.2,
+        "cycling_window_minutes": 60.0,
+        "cycling_max_starts": 6,
+        "heating_stall_minutes": 90.0,  # Kompressor so lange AUS in heating/heating_forced -> Alarm [min]
+        "heating_stall_error_c": 2.0,   # ... UND VL-Soll-Ist-Fehler mindestens so gross [°C]
+        # Coil-Abgleich 10001/10002: liest der Poll einen anderen Wert als den zuletzt von der FSM
+        # geschriebenen (LG setzt 10001 nach internem Stopp zurück), nach der Verzögerung
+        # erneut schreiben. Höchstens max Writes je Fenster, dann Alarm statt Endlosschleife.
+        "wp_switch_reassert_delay_s": 5.0,
+        "wp_switch_reassert_max": 3,
+        "wp_switch_reassert_window_minutes": 30.0,
+        "circuit1_offset": 1.0,
+        # Startmodus heating (Verdichter aus): Kreis 1 = Puffer 1/4 + Marge. Die LG startet erst,
+        # wenn der Auslass ~2 K unter Kreis 1 liegt ; mit Kurve + 1 K allein
+        # wartet sie lange oder läuft gar nicht an.
+        "heating_start_margin_c": 3.0,
+        # Nach internem Verdichter-AUS in heating so lange kein Startmodus (Kreis 1 = Tracking) [min]
+        "heating_restart_pause_minutes": 10.0,
+        # heating Phase 1: Kreis-1-Tracking waehrend Abtauen und so lange danach eingefroren [min].
+        # Sonst faellt Kreis 1 mit dem Auslass (~25 C) auf die Untergrenze, und erholt sich der
+        # Auslass schneller als der Tiefpass, reisst "Auslass > Kreis 1 + 4" und die LG stoppt.
+        "defrost_lp_hold_minutes": 10.0,
+        "boost_energy_state": 5,
+        "boost_pv_min_w": 3500.0,
+        "boost_pv_off_w": 1500.0,
+        # PV muss ununterbrochen so lange >= boost_pv_min_w liegen, bevor Boost startet.
+        # Verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von buffer_charge.
+        "boost_pv_stable_minutes": 15.0,
+        # Mindestlaufzeit in buffer_charge_boost vor jedem Ausstieg (ausser Abtauen/Fensterende).
+        "boost_min_minutes": 30.0,
+        "pv_buffer_max_kwh": 15.0,
+        "heating_hyst": 1.0,  # Hysterese buffer_drain -> idle (°C ueber Heizgrenze)
+        # Einlass-Regelung (40002=1): Sollwerte fuer Modbus-Register 40003
+        "buffer_charge_inlet_temp": 50.0,  # Einlass-Ziel buffer_charge (ganzer Puffer >= 50°C)
+        "boost_inlet_temp": 55.0,  # Einlass-Ziel buffer_charge_boost (+ Heizstab)
+        "boost_inlet_min_c": 45.0,  # Boost startet erst wenn Einlass >= X°C
+        # Hysterese nach erfolgreicher Pufferladung: Neustart erst wenn Puffer 1/2 unter
+        # (buffer_charge_inlet_temp - buffer_charge_hyst) faellt. Nicht Puffer 1/4: der kuehlt
+        # beim Entladen durch den HK-Ruecklauf in ~25 min um 5 K, waehrend 1/2 voll bleibt.
+        "buffer_charge_hyst": 5.0,
+        # PV-Ladung startet nur, wenn PV (15-min-Mittel) mindestens so hoch ist. Die Prognose
+        # (pv_buffer_min_kwh) allein laesst bei geringer Momentanleistung mit Netzstrom laden.
+        "pv_charge_min_w": 2000.0,
+        # Mindestlaufzeit in buffer_charge vor temperaturbasiertem Ausstieg.
+        # Verhindert Fehlausstieg durch heisses Rohrrestwasser (Sommer, Grundfos AUS):
+        # WP-interne Pumpe startet, liest ~52°C Restwasser -> sofortiger Exit wäre falsch.
+        "buffer_charge_min_minutes": 5.0,
+        "setpoint_tau_s": 45.0,  # Zeitkonstante der Sollwert-Glaettung (zeitbasiert) [s]
+        # Silent Mode: nach Abtauende so lange deaktiviert (volle Leistung fuer
+        # schnellere Erholung, weniger Folge-Takte) [h]
+        "silent_mode_defrost_hold_h": 0.5,
+        # Kreis 2 PV-Abschaltung: Heizkurven-Sollwert (inkl. PV-Korrektur) unter
+        # vl_high -> PV deckt den Bedarf bereits unter Heizgrenzen-Niveau.
+        "circuit2_pv_off_delay_s": 3600.0,  # Mindestdauer unter vl_high bis Pumpe AUS [s]
+        "circuit2_pv_off_hyst_c": 1.0,      # Wiedereinschalten erst ab vl_high + x [°C]
+        # Urlaubsmodus (input_boolean.hp_vacation): Heizkurve Kreis 2 um x K absenken.
+        "vacation_setback_k": 1.0,
+    }
+
+    @property
+    def initial_state(self) -> str:
+        return "idle"
+
+    def define_states(self) -> list[str]:
+        return [
+            "idle",
+            "heating",
+            "heating_forced",
+            "hot_water",
+            "buffer_charge",
+            "buffer_charge_boost",
+            "buffer_drain",  # Puffer heizt Haus, WP aus - Ueberbrueckung bis WP noetig
+            "standby",
+        ]
+
+    @staticmethod
+    def _file_revision(path: str) -> str:
+        """Revisionszeile (vom pre-commit-Hook gepflegt) aus den ersten Zeilen lesen."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for _ in range(5):
+                    line = fh.readline()
+                    if line.startswith("# Revision:"):
+                        return line[2:].strip()
+        except Exception:
+            pass
+        return "Revision unbekannt"
+
+    def initialize(self):
+        try:
+            mtime = os.path.getmtime(__file__)
+            mtime_str = datetime.datetime.fromtimestamp(mtime).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            mtime_str = "unbekannt"
+        self.log(
+            f"[HP] Code-Datei: {mtime_str} | {self._file_revision(__file__)}"
+            f" | fsm_base {self._file_revision(os.path.join(os.path.dirname(__file__), 'fsm_base.py'))}",
+            level="WARNING",
+        )
+
+        # -- Sensoren ----------------------------------------------------------
+        self._sensor_outdoor_temp = self.args["sensor_outdoor_temp"]
+        self._sensor_outdoor_temp_1h = self.args.get(
+            "sensor_outdoor_temp_1h", "sensor.aussentemperatur_mittelwert_1h"
+        )
+        self._sensor_pv_power_w = self.args["sensor_pv_power_w"]
+        self._sensor_pv_energy_kwh = self.args["sensor_pv_energy_kwh"]
+        self._sensor_flow_temp = self.args["sensor_flow_temp"]
+        self._sensor_return_temp = self.args.get("sensor_return_temp", "")
+        # Heizkreis-Ruecklauf (Kalt-Eingang des Mischers) - fuer Mischer-Feedforward
+        self._sensor_mixer_return_temp = self.args.get(
+            "sensor_mixer_return_temp", "sensor.hp_temp_sensors_2036e1_heizung_rl"
+        )
+        self._sensor_wp_leaving_temp = self.args.get("sensor_wp_leaving_temp", "")
+        self._sensor_buffer_bottom = self.args["sensor_buffer_bottom"]
+        self._sensor_buffer_mid = self.args["sensor_buffer_mid"]
+        self._sensor_buffer_mid_high = self.args["sensor_buffer_mid_high"]
+        self._sensor_buffer_top = self.args["sensor_buffer_top"]
+        # LG-WW-Fuehler (Modbus 30006) - nach diesem Fuehler laedt die LG WW
+        self._sensor_ww_temp = self.args.get(
+            "sensor_ww_temp", "sensor.temperatur_pufferspeicher_30006"
+        )
+        # Wassereinlasstemperatur WP (Modbus 30003) - Regelgroesse bei 40002=1
+        self._sensor_wp_inlet_temp = self.args.get(
+            "sensor_wp_inlet_temp", "sensor.wassereinlasstemperatur_30003"
+        )
+
+        # -- Steuerung ---------------------------------------------------------
+        self._switch_heating = self.args.get(
+            "switch_heating", "switch.heizungsschalter_10001"
+        )
+        self._switch_hot_water = self.args.get(
+            "switch_hot_water", "switch.warmwasserschalter_10002"
+        )
+        self._input_setpoint_circuit1 = self.args.get(
+            "input_setpoint_circuit1", "input_number.thermav_40003"
+        )
+        self._input_setpoint_circuit2 = self.args.get(
+            "input_setpoint_circuit2", "input_number.thermav_40006"
+        )
+        self._input_setpoint_ww = self.args.get(
+            "input_setpoint_ww", "input_number.thermav_40009"
+        )
+        self._binary_compressor = self.args.get(
+            "binary_compressor", "binary_sensor.kompressor_20004"
+        )
+        self._binary_wp_pump = self.args.get(
+            "binary_wp_pump", "binary_sensor.umwalzpumpe_20002"
+        )
+        self._cover_mixer = self.args.get("cover_mixer", "")
+        self._mixer_full_travel_s = float(self.args.get("mixer_full_travel_s", 123))
+        # Modbus-Verbindung fuer direkten Write (40002 Steuermethode)
+        self._modbus_hub = self.args.get("modbus_hub", "modbus_waveshare")
+        self._modbus_slave = int(self.args.get("modbus_slave", 1))
+
+        # -- Grundfos Pumpe ----------------------------------------------------
+        self._switch_circuit2_pump = self.args.get("switch_circuit2_pump", "")
+
+        # -- Silent Mode -------------------------------------------------------
+        self._switch_silent_mode = self.args.get(
+            "switch_silent_mode", "switch.silent_mode_10003"
+        )
+        # Silent Mode ist pauschal aktiv (siehe _desired_silent_mode); dieses Feld
+        # haelt das Ende eines temporaeren "Abtauen-beendet"-Fensters, in dem er
+        # unabhaengig vom Zustand deaktiviert bleibt.
+        self._silent_override_until: datetime.datetime | None = None
+
+        # -- Dry-Run -----------------------------------------------------------
+        self._dry_run_entity = self.args.get(
+            "dry_run_entity", "input_boolean.hp_dry_run"
+        )
+
+        # -- Mischer-Feedforward Toggle (A/B-Test) -----------------------------
+        # Wenn Entity fehlt oder nicht 'off' -> FF aktiv.
+        self._mixer_ff_entity = self.args.get(
+            "mixer_ff_entity", "input_boolean.hp_mixer_ff"
+        )
+
+        # -- Urlaubsmodus ------------------------------------------------------
+        # EIN: kein WW im Fenster, keine PV-Ladung/kein PV-Boost, Heizkurve Kreis 2 - vacation_setback_k.
+        self._vacation_entity = self.args.get(
+            "vacation_entity", "input_boolean.hp_vacation"
+        )
+
+        # -- Dashboard-Visualisierung ------------------------------------------
+        self._input_pi_position = self.args.get(
+            "input_pi_position", "input_number.hp_mischer_pi_position"
+        )
+
+        # -- Heizstab-Boost ----------------------------------------------------
+        self._input_energy_state = self.args.get(
+            "input_energy_state", "input_number.thermav_40010"
+        )
+        self._binary_defrost = self.args.get(
+            "binary_defrost", "binary_sensor.abtauen_20005"
+        )
+        self._counter_defrost = self.args.get(
+            "counter_defrost", "counter.hp_defrost_count"
+        )
+        self._counter_defrost_total = self.args.get(
+            "counter_defrost_total", "counter.hp_defrost_count_total"
+        )
+        self._binary_aux_heater_1 = self.args.get(
+            "binary_aux_heater_1", "binary_sensor.zusatzheizung_1_20011"
+        )
+        self._binary_aux_heater_2 = self.args.get(
+            "binary_aux_heater_2", "binary_sensor.zusatzheizung_2_20012"
+        )
+        self._binary_werktag = self.args.get("binary_werktag", "binary_sensor.werktag")
+        self._boost_window_start = self.args.get("boost_window_start", "10:00")
+        self._boost_window_end = self.args.get("boost_window_end", "18:00")
+
+        # -- HA-Parameter Prefix -----------------------------------------------
+        self._ha_param_prefix = self.args.get("ha_param_prefix", "input_number.hp_")
+
+        # Kreis 1 trackt den LG-Auslass 30004 (nicht den Dallas-Anlegefühler, der ≈ 3.9 K
+        # tiefer liegt). Ein alter positiver Offset aus HA würde Kreis 1 über
+        # den Auslass heben → Mitkopplung bis heat_curve_vl_low.
+        c1_margin = self._forced_setpoint_offset + self._circuit1_offset
+        if c1_margin > 0:
+            self.log(
+                f"[HP] ! forced_setpoint_offset + circuit1_offset = {c1_margin:+.1f} K > 0: "
+                f"Kreis 1 liegt über dem WP-Auslass ({self._sensor_wp_leaving_temp}) -> "
+                f"Mitkopplung. input_number.hp_forced_setpoint_offset auf ca. -3.0 setzen.",
+                level="WARNING",
+            )
+
+        # -- Interne Zustaende --------------------------------------------------
+        self._pi_prev_error = 0.0  # (Legacy) vorheriger Fehler - vom Trim nicht genutzt
+        self._pi_position = (
+            50.0  # wird in on_enter_heating/buffer_drain aus Cover gelesen
+        )
+        # Mischer Feedforward + Trim
+        self._mixer_ff_base = 0.0      # Feedforward-Stellung (% aus invertierter Mischgleichung)
+        self._mixer_trim_i = 0.0       # Trim-Integrator (%)
+        self._mixer_trim_init = True   # erster Step nach Start: bumpless initialisieren
+        self._mixer_handle = None
+        self._mixer_ideal = 0.0        # Ideal-Stellung (Slew-limitiert); _pi_position = zuletzt kommandiert
+        self._mixer_last_cmd_t: datetime.datetime | None = None  # letzter Fahrbefehl
+        self._mixer_stopped_at: datetime.datetime | None = None  # letzter Stopp des Reglers
+        self._mixer_hold_until: datetime.datetime | None = None  # Start-Haltezeit (veralteter RL)
+        self._mixer_tank_f: float | None = None  # tiefpassgefilterter Tank-Fuehler (FF)
+        self._mixer_rl_f: float | None = None    # tiefpassgefilterter RL-Fuehler (FF)
+        self._mixer_filter_t: datetime.datetime | None = None
+        self._forced_lp_value = None
+        self._decay_start_time = None   # Zeitstempel: Beginn Phase-2-Absenkung
+        self._decay_lp_start = None     # LP-Wert beim Start der Absenkung
+        self._defrost_ended_at = None   # letztes Abtauen (Ende bzw. zuletzt aktiv gesehen)
+        self._compressor_on_since = None
+        self._compressor_off_since = None  # letztes Verdichter-AUS (Restart-Pause im Startmodus)
+        # Interner Verdichter-Stopp in heating nach >= min_runtime: buffer_drain schon ab
+        # on-Schwelle. Geloescht bei Verdichter-EIN und Eintritt heating.
+        self._heating_internal_stop = False
+        self._boost_pv_stable_since = None  # seit wann PV ununterbrochen >= boost_pv_min_w ist
+        self._heating_stall_notified = False  # Alarm "Kompressor laeuft trotz heating nicht" schon gemeldet?
+        self._forced_end_time = None  # absoluter Zeitstempel: Ende der Mindestlaufzeit
+        self._hw_window_active = False
+        self._hw_manual = False  # WW manuell erzwungen (force_state) - gilt ausserhalb des Fensters
+        self._ramp_c1_current = (
+            None  # aktuelle Kreis1-Position waehrend Ramp-Down (None = inaktiv)
+        )
+        self._ramp_c1_handle = None  # AppDaemon-Timer-Handle fuer Kreis1-Ramp-Down
+        self._buffer_fully_charged = (
+            False  # Hysterese: True nach erfolgreicher Pufferladung
+        )
+        self._setpoint_ewma: float | None = None  # EWMA des fertigen Heizkurven-Sollwerts
+        self._setpoint_ewma_t: datetime.datetime | None = None  # Zeitstempel letzte EWMA-Aktualisierung
+        self._pv_ema_kw: float | None = None  # zeitbasierte EMA der PV-Leistung [kW]
+        self._pv_ema_t: datetime.datetime | None = None
+        self._circuit2_below_vl_high_since: datetime.datetime | None = None
+        self._circuit2_pv_shutoff: bool = False  # True: Kreis-2-Pumpe wegen PV-Ueberschuss AUS
+        self._last_forced_c1: float | None = (
+            None  # Ratchet: nur steigende Werte in Mindestlaufzeit
+        )
+        self._outdoor_temp_cache: float | None = None  # letzter gueltiger AT-EMA-Wert
+        self._outdoor_temp_1h_cache: float | None = None  # letzter gueltiger AT-1h-Wert
+        self._flow_temp_cache: float | None = None  # letzter gueltiger VL-Wert
+        self._buffer_mid_cache: float | None = None  # letzter gueltiger Puffer-1/2-Wert
+        self._buffer_bottom_cache: float | None = None  # letzter gueltiger Puffer-1/4-Wert
+        self._mixer_return_cache: float | None = None  # letzter gueltiger Heizkreis-RL-Wert
+        self._ww_temp_cache: float | None = None  # letzter gueltiger 30006-Wert (LG-WW)
+        self._compressor_starts: collections.deque = collections.deque()  # Takt-Schutz
+        self._last_wp_mode_log: str | None = None  # Deduplizierung: letzter Modbus-Log
+        self._wp_switch_expected: dict = {}  # Coil-Entity -> zuletzt von der FSM geschrieben ('on'/'off')
+        self._wp_switch_reasserts: collections.deque = collections.deque()  # Zeitpunkte der Nachschreib-Writes
+        self._wp_switch_alarm: bool = False  # Begrenzung im aktuellen Fenster schon gemeldet?
+        self._last_pi_position: float | None = None  # letzte PI-Gleichgewichtsposition vor Schliessen
+        self._mixer_was_closed: bool = False  # _mixer_full_close() wurde aufgerufen; Cover evtl. noch in Bewegung
+
+        # Startup-Grace: direkt nach (Neu-)Start keine WP-Abschalt-Entscheidung.
+        # Schuetzt gegen Fehl-Abschaltung beim taeglichen Backup (~02:05), wenn
+        # ESPHome-/Statistics-Sensoren nach Container-Neustart noch nicht frisch sind.
+        self._startup_time = datetime.datetime.now()
+        self._startup_grace_s = float(self.args.get("startup_grace_seconds", 180))
+
+        super().initialize()
+
+        if self._startup_grace_s > 0:
+            self.log(
+                f"[HP] Startup-Grace aktiv: keine WP-Abschaltung für {self._startup_grace_s:.0f}s",
+                level="INFO",
+            )
+
+        # Energiezustand beim Start auf Normal setzen
+        self._set_energy_state(2)
+
+        # Puffer-Hysterese nach Neustart wiederherstellen (Puffer 1/2 noch warm oder unbekannt)
+        if self._buffer_still_charged():
+            self._buffer_fully_charged = True
+            self.log(
+                f"[HP] Puffer-Hysterese wiederhergestellt: Puffer 1/2 {self._buffer_mid():.1f}C "
+                f">= {self._charge_restart_temp():.1f}C (oder unbekannt)",
+                level="INFO",
+            )
+
+        # Kompressor-Zustand nach Neustart rekonstruieren:
+        # listen_state feuert NICHT fuer den schon bestehenden Zustand. Lief der
+        # Kompressor durch das Backup hindurch, bliebe _compressor_on_since None und
+        # 'heating -> buffer_drain' (Guard: _compressor_on_since is None) wuerde die
+        # laufende WP faelschlich stoppen. Konservativ now() setzen -> frische
+        # Mindestlaufzeit, WP laeuft weiter bis zum echten Kompressor-AUS-Signal.
+        try:
+            if self.get_state(self._binary_compressor) == "on":
+                self._compressor_on_since = datetime.datetime.now()
+                self.log(
+                    "[HP] Kompressor läuft bei Start - _compressor_on_since "
+                    "rekonstruiert (frische Mindestlaufzeit)",
+                    level="INFO",
+                )
+        except Exception as e:
+            self.log(f"[HP] Kompressor-Restore fehlgeschlagen: {e}", level="WARNING")
+
+        # WW-Fenster nach Neustart wiederherstellen falls gerade aktiv
+        self._restore_hw_window_if_active()
+
+        # Periodischer Heartbeat-Log alle 10 Minuten
+        self.run_every(self._log_state_heartbeat, "now", 600)
+
+    # -------------------------------------------------------------------------
+    # Parameter-Lesehilfen
+    # -------------------------------------------------------------------------
+
+    def _get_param(self, key: str) -> float:
+        entity_id = f"{self._ha_param_prefix}{key}"
+        try:
+            raw = self.get_state(entity_id)
+            if raw not in (None, "unavailable", "unknown", ""):
+                return float(raw)
+        except Exception:
+            pass
+        apps_key = self._defaults_to_apps_key(key)
+        if apps_key in self.args:
+            return float(self.args[apps_key])
+        return float(self._DEFAULTS.get(key, 0.0))
+
+    def _get_time_param(self, key_h: str, key_m: str) -> str:
+        h = int(self._get_param(key_h))
+        m = int(self._get_param(key_m))
+        return f"{h:02d}:{m:02d}"
+
+    # apps.yaml verwendet bis auf wenige Ausnahmen denselben Schluesselnamen wie
+    # die internen _DEFAULTS-Keys. Nur abweichende Namen hier auflisten.
+    _APPS_KEY_EXCEPTIONS: dict[str, str] = {}
+
+    @classmethod
+    def _defaults_to_apps_key(cls, key: str) -> str:
+        return cls._APPS_KEY_EXCEPTIONS.get(key, key)
+
+    # -- Convenience-Properties ------------------------------------------------
+
+    @property
+    def _heating_threshold(self) -> float:
+        return self._get_param("heat_curve_at_high")
+
+    @property
+    def _heating_hyst(self) -> float:
+        """Hysterese-Band fuer buffer_drain -> idle. Austritt erst bei AT >= threshold + hyst."""
+        return self._get_param("heating_hyst")
+
+    def _buffer_drain_margin(self) -> float:
+        return self._get_param("buffer_drain_margin")
+
+    def _buffer_drain_threshold_on(self) -> float:
+        """WP-Start-Schwelle (heating EIN): AT-Heizkurve ohne PV-Korrektur + Margin.
+        PV-Korrektur bewusst ausgelassen: Pufferkapazitaet haengt nicht von PV ab,
+        PV-Jitter wuerde sonst die Schwelle zittern lassen und Taktbetrieb riskieren."""
+        return (
+            self._calc_flow_setpoint(with_pv_correction=False)
+            + self._buffer_drain_margin()
+        )
+
+    def _buffer_drain_threshold_off(self) -> float:
+        """buffer_drain-Schwelle (Entladen statt WP): on-Schwelle + Hysterese.
+        Erzeugt totes Band zwischen EIN und AUS - verhindert Takt an der Grenze."""
+        return self._buffer_drain_threshold_on() + self._get_param("buffer_drain_hyst")
+
+    def _buffer_drain_entry_threshold(self) -> float:
+        """Einstiegs-Schwelle fuer buffer_drain, abhaengig vom aktuellen Zustand.
+        Aus idle/standby: on-Schwelle - sonst parkt die FSM bei Heizbedarf in idle,
+        solange Puffer 1/2 zwischen on und off liegt (Pumpe aus, Haus unversorgt, bis
+        der Puffer per Standverlust unter die on-Schwelle faellt).
+        Aus heating: off-Schwelle (on + hyst) - die Hysterese gegen Takt bleibt dort.
+        Ausnahme: Die LG hat in heating nach >= min_runtime intern gestoppt -> on-Schwelle.
+        Der Stopp ist dann schon passiert, die Hysterese schuetzt vor nichts mehr; mit der
+        off-Schwelle blieb die FSM in heating und die LG lief nach 4 min wieder an
+        (Puffer 1/2 zwischen on- und off-Schwelle)."""
+        if self.state in ("idle", "standby"):
+            return self._buffer_drain_threshold_on()
+        if self.state == "heating" and getattr(self, "_heating_internal_stop", False):
+            return self._buffer_drain_threshold_on()
+        return self._buffer_drain_threshold_off()
+
+    @property
+    def _ww_target(self) -> float:
+        return self._get_param("ww_target_temp")
+
+    @property
+    def _buffer_charge_inlet_temp(self) -> float:
+        """Einlass-Sollwert (40002=1) fuer buffer_charge. Ganzer Puffer >= X°C."""
+        return self._get_param("buffer_charge_inlet_temp")
+
+    @property
+    def _boost_inlet_temp(self) -> float:
+        """Einlass-Sollwert (40002=1) fuer buffer_charge_boost (WP + Heizstab)."""
+        return self._get_param("boost_inlet_temp")
+
+    @property
+    def _boost_inlet_min_c(self) -> float:
+        """Mindest-Einlass fuer Boost-Aktivierung (Boost startet erst wenn Puffer bereits warm)."""
+        return self._get_param("boost_inlet_min_c")
+
+    @property
+    def _buffer_charge_hyst(self) -> float:
+        """Hysterese nach erfolgreicher Pufferladung.
+        Neustart erst wenn Puffer 1/2 < (buffer_charge_inlet_temp - buffer_charge_hyst).
+        """
+        return self._get_param("buffer_charge_hyst")
+
+    @property
+    def _pv_buffer_min_kwh(self) -> float:
+        return self._get_param("pv_buffer_min_kwh")
+
+    @property
+    def _pv_buffer_max_kwh(self) -> float:
+        return self._get_param("pv_buffer_max_kwh")
+
+    @property
+    def _pv_correction_per_kw(self) -> float:
+        return self._get_param("pv_correction_per_kw")
+
+    @property
+    def _standby_minutes(self) -> float:
+        return self._get_param("standby_minutes")
+
+    @property
+    def _min_runtime_minutes(self) -> float:
+        return self._get_param("min_runtime_minutes")
+
+    @property
+    def _forced_setpoint_offset(self) -> float:
+        return self._get_param("forced_setpoint_offset")
+
+    @property
+    def _forced_lp_alpha(self) -> float:
+        return self._get_param("forced_lp_alpha")
+
+    @property
+    def _circuit1_offset(self) -> float:
+        return self._get_param("circuit1_offset")
+
+    def _mixer_ff_enabled(self) -> bool:
+        """Feedforward aktiv, ausser die Toggle-Entity steht explizit auf 'off'."""
+        if not self._mixer_ff_entity:
+            return True
+        try:
+            return self.get_state(self._mixer_ff_entity) != "off"
+        except Exception:
+            return True
+
+    def _vacation_active(self) -> bool:
+        """Urlaubsmodus nur bei explizitem 'on' (fehlende Entity -> Normalbetrieb)."""
+        entity = getattr(self, "_vacation_entity", "")
+        if not entity:
+            return False
+        try:
+            return self.get_state(entity) == "on"
+        except Exception:
+            return False
+
+    def _mixer_return_temp(self):
+        """Heizkreis-RL (Kalt-Eingang Mischer) als float oder None (mit Cache)."""
+        return self._sensor_value_or_none(
+            self._sensor_mixer_return_temp, "_mixer_return_cache"
+        )
+
+    # Ventil-Kennlinie (Stufentests):
+    # (Mischverhaeltnis 0-1 = (VL-RL)/(Tank-RL), tatsaechlich noetige Stellung %).
+    # 20%->0.034, 40%->0.223, 60%->0.550 gemessen (Test 1, 35min Haltezeit, letzte
+    # 5min gemittelt, ueber mehrere Auswertemethoden konsistent). Deutliche
+    # Totzone/geringe Autoritaet im unteren Drittel - Ventil braucht bei kleinem
+    # Soll-Mischverhaeltnis deutlich mehr Stellung als linear angenommen.
+    # 80% NICHT gemessen: Test 2 (20min Haltezeit) durch WW-Zapfung waehrend der
+    # 80%-Stufe gestoert (Tank-Schichtung gestoert, Sensor 2/4 nicht mehr
+    # repraesentativ fuer Mischer-Zulauf -> alle 3 Auswertemethoden inkl.
+    # Hammerstein-Fit mit fixiertem L/tau lieferten unplausible/instabile Werte).
+    # 80% daher linear zwischen 60% und 100% interpoliert
+    # (0.78) statt gemessen - Platzhalter bis zu einer stoerungsfreien Nachmessung.
+    # Randpunkte (0,0)/(1,100) sind Modellannahme (volle Endanschlaege), nicht
+    # gemessen.
+    _VALVE_CAL = (
+        (0.000, 0.0),    # Randannahme
+        (0.003, 5.0),    # Modell (Hill-Sigmoid-Fit)
+        (0.010, 10.0),   # Modell
+        (0.024, 15.0),   # Modell
+        (0.034, 20.0),   # gemessen
+        (0.072, 25.0),   # Modell
+        (0.110, 30.0),   # Modell
+        (0.158, 35.0),   # Modell
+        (0.223, 40.0),   # gemessen
+        (0.288, 45.0),   # Modell
+        (0.369, 50.0),   # Modell
+        (0.458, 55.0),   # Modell
+        (0.550, 60.0),   # gemessen
+        (0.646, 65.0),   # Modell
+        (0.735, 70.0),   # Modell
+        (0.815, 75.0),   # Modell
+        (0.882, 80.0),   # Modell
+        (0.934, 85.0),   # Modell
+        (0.971, 90.0),   # Modell
+        (0.992, 95.0),   # Modell
+        (1.000, 100.0),  # Randannahme
+    )
+
+    def _valve_position_for_ratio(self, ratio_pct: float) -> float:
+        """Invertiert die (nichtlineare) Ventilkennlinie: gewuenschtes
+        Mischverhaeltnis [0..100]% -> tatsaechlich noetige Stellposition [0..100]%,
+        stueckweise linear interpoliert ueber _VALVE_CAL."""
+        ratio = max(0.0, min(1.0, ratio_pct / 100.0))
+        table = self._VALVE_CAL
+        if ratio <= table[0][0]:
+            return table[0][1]
+        for (r0, p0), (r1, p1) in zip(table, table[1:]):
+            if ratio <= r1:
+                if r1 == r0:
+                    return p1
+                frac = (ratio - r0) / (r1 - r0)
+                return p0 + frac * (p1 - p0)
+        return table[-1][1]
+
+    @property
+    def _mixer_kp(self) -> float:
+        return self._get_param("mixer_kp")
+
+    @property
+    def _mixer_ki(self) -> float:
+        return self._get_param("mixer_ki")
+
+    @property
+    def _mixer_interval_s(self) -> float:
+        return self._get_param("mixer_interval_s")
+
+    @property
+    def _hw_duration_minutes(self) -> int:
+        return int(self._get_param("hw_duration_minutes"))
+
+    @property
+    def _boost_energy_state(self) -> int:
+        try:
+            raw = self.get_state("input_select.hp_boost_energy_state")
+            if raw and raw not in ("unavailable", "unknown"):
+                return int(raw.split(" ")[0])
+        except Exception:
+            pass
+        return int(self._DEFAULTS.get("boost_energy_state", 5))
+
+    @property
+    def _boost_pv_min_w(self) -> float:
+        return self._get_param("boost_pv_min_w")
+
+    @property
+    def _boost_pv_off_w(self) -> float:
+        return self._get_param("boost_pv_off_w")
+
+    @property
+    def _hw_morning_weekday(self) -> str:
+        return self._get_datetime_time("input_datetime.hp_hw_morning_weekday", "05:30")
+
+    @property
+    def _hw_morning_weekend(self) -> str:
+        return self._get_datetime_time("input_datetime.hp_hw_morning_weekend", "07:30")
+
+    @property
+    def _hw_evening(self) -> str:
+        return self._get_datetime_time("input_datetime.hp_hw_evening", "20:30")
+
+    def _get_datetime_time(self, entity_id: str, default: str) -> str:
+        try:
+            raw = self.get_state(entity_id)
+            if raw and raw not in ("unavailable", "unknown"):
+                return raw[:5]
+        except Exception:
+            pass
+        return default
+
+    # -------------------------------------------------------------------------
+    # Dry-Run
+    # -------------------------------------------------------------------------
+
+    def _is_dry_run(self) -> bool:
+        try:
+            return self.get_state(self._dry_run_entity) == "on"
+        except Exception:
+            return False
+
+    # -------------------------------------------------------------------------
+    # Uebergaenge
+    # -------------------------------------------------------------------------
+
+    def define_transitions(self) -> list[Transition]:
+        return [
+            # WW hat Vorrang (aus allen aktiven Zustaenden) - aber nur wenn der Puffer
+            # oben die WW-Reserve unterschreitet (siehe _need_hot_water).
+            Transition(
+                "idle", "hot_water", self._need_hot_water, label="WW-Fenster geöffnet"
+            ),
+            Transition(
+                "heating",
+                "hot_water",
+                self._need_hot_water,
+                label="WW verdrängt Heizung",
+            ),
+            Transition(
+                "buffer_charge",
+                "hot_water",
+                self._need_hot_water,
+                label="WW verdrängt PV-Ladung",
+            ),
+            Transition(
+                "buffer_charge_boost",
+                "hot_water",
+                self._need_hot_water,
+                label="WW verdrängt Boost",
+            ),
+            Transition(
+                "buffer_drain",
+                "hot_water",
+                self._need_hot_water,
+                label="WW verdrängt Puffer-Entladen",
+            ),
+            # Faellt der Puffer erst waehrend einer Standby-Pause unter die WW-Schwelle
+            # (z.B. heating -> standby im WW-Fenster), nach Ablauf der Pause WW starten.
+            Transition(
+                "standby",
+                "hot_water",
+                lambda: self._standby_done() and self._need_hot_water(),
+                label="Standby vorbei, WW nötig",
+            ),
+            # WW fertig -> Standby (Fenster und manuell)
+            Transition(
+                "hot_water",
+                "standby",
+                self._hw_target_reached,
+                label="WW-Ziel erreicht (30006)",
+            ),
+            Transition(
+                "hot_water",
+                "standby",
+                lambda: self._hw_manual
+                and self.minutes_in_state() >= self._get_param("hw_manual_max_min"),
+                label="WW manuell: Zeitlimit",
+            ),
+            # Ein gestarteter WW-Lauf endet nicht mit dem Fenster, sondern erst bei
+            # 30006 >= Ziel (sonst bricht ein kurz vor Fensterende
+            # gestarteter Lauf ab, bevor das Soll erreicht ist). Absicherung: Zeitlimit, und bei unbekanntem 30006
+            # (Ziel nicht prüfbar) weiter das Fensterende.
+            Transition(
+                "hot_water",
+                "standby",
+                lambda: not self._hw_manual
+                and self.minutes_in_state() >= self._get_param("hw_window_max_min"),
+                label="WW: Zeitlimit",
+            ),
+            Transition(
+                "hot_water",
+                "standby",
+                lambda: not self._hw_window_active
+                and not self._hw_manual
+                and self._ww_temp() is None,
+                label="WW-Fenster geschlossen, 30006 unbekannt",
+            ),
+            # Urlaubsmodus bricht einen Fenster-WW-Lauf ab; manuell erzwungenes WW bleibt.
+            Transition(
+                "hot_water",
+                "standby",
+                lambda: not self._hw_manual and self._vacation_active(),
+                label="Urlaubsmodus: WW abgebrochen",
+            ),
+            # Heizung EIN (Puffer 1/2 kalt -> WP muss ran)
+            Transition(
+                "idle",
+                "heating",
+                self._need_heating,
+                label="Heizbedarf (1/2-Sensor kalt)",
+            ),
+            Transition(
+                "standby",
+                "heating",
+                lambda: self._standby_done() and self._need_heating(),
+                label="Standby vorbei, Heizung nötig",
+            ),
+            Transition(
+                "buffer_drain",
+                "heating",
+                self._need_heating,
+                label="Puffer erschöpft - WP startet",
+            ),
+            # Heizung AUS -> Mindestlaufzeit oder Standby
+            # Exit: AT 1h (schnell) statt EMA - reagiert sofort wenn es warm wird.
+            # Entry (idle/standby -> heating) bleibt EMA-basiert: verhindert Einschalten
+            # bei kurzem Temperaturtief ohne echten Heizbedarf.
+            Transition(
+                "heating",
+                "heating_forced",
+                lambda: (
+                    self._at_above_threshold()
+                    and self._compressor_on_since is not None
+                    and self._compressor_runtime_minutes() < self._min_runtime_minutes
+                ),
+                label="Kein Heizbedarf (EMA oder AT 1h warm), Mindestlaufzeit läuft noch",
+            ),
+            Transition(
+                "heating",
+                "standby",
+                lambda: (
+                    self._at_above_threshold()
+                    and (
+                        self._compressor_on_since is None
+                        or self._compressor_runtime_minutes() >= self._min_runtime_minutes
+                    )
+                ),
+                label="Kein Heizbedarf (EMA oder AT 1h warm), Mindestlaufzeit abgelaufen oder Kompressor nie gestartet",
+            ),
+            Transition(
+                "heating",
+                "buffer_drain",
+                lambda: self._need_buffer_drain() and self._compressor_on_since is None,
+                label="Puffer aufgeladen, Kompressor intern gestoppt - Puffer entladen",
+            ),
+            # heating_forced
+            Transition(
+                "heating_forced",
+                "hot_water",
+                self._need_hot_water,
+                label="WW-Vorrang unterbricht Mindestlaufzeit",
+            ),
+            Transition(
+                "heating_forced",
+                "heating",
+                lambda: self._forced_time_elapsed() and self._need_heating(),
+                label="Mindestlaufzeit abgelaufen, Heizbedarf weiterhin vorhanden",
+            ),
+            Transition(
+                "heating_forced",
+                "standby",
+                lambda: self._forced_time_elapsed() and self._at_above_threshold(),
+                label="Mindestlaufzeit abgelaufen, kein Heizbedarf (EMA oder AT 1h warm)",
+            ),
+            # PV-Ladung EIN (Vorrang vor buffer_drain)
+            Transition(
+                "idle",
+                "buffer_charge",
+                self._should_charge_buffer,
+                label="PV-Überschuss verfügbar",
+            ),
+            Transition(
+                "standby",
+                "buffer_charge",
+                lambda: self._standby_done() and self._should_charge_buffer(),
+                label="Standby vorbei, PV-Laden",
+            ),
+            Transition(
+                "buffer_drain",
+                "buffer_charge",
+                self._should_charge_buffer,
+                label="PV-Überschuss - Laden statt Entladen",
+            ),
+            # Urlaubsmodus beendet PV-Ladung und Boost sofort (vor allen anderen
+            # Ladungs-Uebergaengen, sonst ginge Boost erst noch nach buffer_charge).
+            Transition(
+                "buffer_charge",
+                "standby",
+                self._vacation_active,
+                label="Urlaubsmodus: PV-Ladung abgebrochen",
+            ),
+            Transition(
+                "buffer_charge_boost",
+                "standby",
+                self._vacation_active,
+                label="Urlaubsmodus: PV-Boost abgebrochen",
+            ),
+            # PV-Boost
+            Transition(
+                "buffer_charge",
+                "buffer_charge_boost",
+                self._should_boost,
+                label="PV-Boost: Heizstab zuschaltbar",
+            ),
+            Transition(
+                "buffer_charge_boost",
+                "buffer_charge",
+                self._should_stop_boost,
+                label="Boost-Bedingung entfallen",
+            ),
+            # PV-Ladung AUS
+            Transition(
+                "buffer_charge",
+                "standby",
+                lambda: (
+                    self._wp_inlet_temp() >= self._buffer_charge_inlet_temp
+                    and self.minutes_in_state()
+                    >= self._get_param("buffer_charge_min_minutes")
+                ),
+                label="Einlass-Ziel erreicht - Puffer vollständig geladen (40002=1)",
+            ),
+            Transition(
+                "buffer_charge",
+                "standby",
+                lambda: self._pv_energy_kwh() < self._pv_buffer_min_kwh * 0.5,
+                label="PV-Ertrag zu niedrig",
+            ),
+            Transition(
+                "buffer_charge_boost",
+                "standby",
+                lambda: (
+                    self.minutes_in_state() >= self._get_param("boost_min_minutes")
+                    and (
+                        self._wp_inlet_temp() >= self._boost_inlet_temp
+                        or self._pv_energy_kwh() < self._pv_buffer_min_kwh * 0.5
+                    )
+                ),
+                label="Boost-Einlass-Ziel erreicht oder PV weg (nach Mindestlaufzeit)",
+            ),
+            # -- Puffer-Entladen (buffer_drain) -----------------------------------
+            # Puffer warm + AT kalt -> Pumpe + Mischer liefern Pufferwaerme, WP bleibt aus.
+            # Uebergang zu heating wenn Puffer 1/2 unter Schwelle (WP noetig).
+            Transition(
+                "idle",
+                "buffer_drain",
+                self._need_buffer_drain,
+                label="AT kalt, Puffer warm - Entladen ohne WP",
+            ),
+            Transition(
+                "standby",
+                "buffer_drain",
+                lambda: self._standby_done() and self._need_buffer_drain(),
+                label="Standby vorbei, Puffer liefert ans Haus",
+            ),
+            Transition(
+                "buffer_drain",
+                "idle",
+                self._at_above_threshold,
+                label="Kein Heizbedarf (EMA oder AT 1h warm) - Entladen beendet",
+            ),
+            # Standby -> Idle: Catch-all wenn heating/buffer_drain/buffer_charge nicht greifen
+            # (AT warm, oder Puffer 1/2 noch unbekannt nach Neustart). Kein AT-Check hier,
+            # damit die FSM nie in standby haengen bleibt. Bei kaltem AT greift vorher immer
+            # heating (Puffer < on-Schwelle) oder buffer_drain (Puffer >= on-Schwelle).
+            # idle -> heating / buffer_drain greifen danach wieder mit ihren eigenen Bedingungen.
+            Transition(
+                "standby",
+                "idle",
+                lambda: (
+                    self._standby_done()
+                    and not self._need_hot_water()
+                    and not self._should_charge_buffer()
+                ),
+                label="Standby abgelaufen, kein anderer Bedarf",
+            ),
+        ]
+
+    # -------------------------------------------------------------------------
+    # Trigger
+    # -------------------------------------------------------------------------
+
+    def define_triggers(self):
+        for s in [
+            self._sensor_outdoor_temp,
+            self._sensor_pv_power_w,
+            self._sensor_pv_energy_kwh,
+            self._sensor_buffer_bottom,
+            self._sensor_buffer_mid,
+            self._sensor_buffer_mid_high,
+            self._sensor_buffer_top,
+            self._sensor_ww_temp,
+        ]:
+            self.listen_state(self._on_sensor_change, s)
+
+        if self._sensor_wp_leaving_temp:
+            self.listen_state(
+                self._on_wp_leaving_temp_change, self._sensor_wp_leaving_temp
+            )
+
+        if self._sensor_return_temp:
+            self.listen_state(self._on_sensor_change, self._sensor_return_temp)
+
+        if self._binary_aux_heater_1:
+            self.listen_state(self._on_aux_heater_change, self._binary_aux_heater_1)
+        if self._binary_aux_heater_2:
+            self.listen_state(self._on_aux_heater_change, self._binary_aux_heater_2)
+
+        # Inlet-Sensor abhoeren (fuer buffer_charge/boost Exit-Bedingung)
+        self.listen_state(self._on_sensor_change, self._sensor_wp_inlet_temp)
+
+        for key in [
+            "heat_curve_at_high",
+            "buffer_drain_margin",
+            "buffer_drain_hyst",
+            "ww_target_temp",
+            "pv_buffer_min_kwh",
+            "pv_buffer_max_kwh",
+            "min_runtime_minutes",
+            "standby_minutes",
+            "buffer_charge_inlet_temp",
+            "buffer_charge_min_minutes",
+            "boost_inlet_temp",
+            "cycling_window_minutes",
+            "cycling_max_starts",
+        ]:
+            entity_id = f"{self._ha_param_prefix}{key}"
+            self.listen_state(self._on_param_change, entity_id, attribute="state")
+
+        if self._dry_run_entity:
+            self.listen_state(self._on_dry_run_change, self._dry_run_entity)
+        if self._vacation_entity:
+            self.listen_state(self._on_vacation_change, self._vacation_entity)
+
+        self.run_every(self.evaluate_transitions, self.datetime(), 60)
+        self.run_every(self._sync_modbus_setpoints, self.datetime(), 60)
+        self.run_every(self._apply_silent_mode, self.datetime(), 60)
+        self.run_every(self._update_circuit2_pv_shutoff, self.datetime(), 60)
+        self.run_every(self._check_heating_stall, self.datetime(), 60)
+        self.run_every(self._update_boost_pv_stability, self.datetime(), 60)
+        self._schedule_hot_water_windows()
+
+        prefix = self.args.get("event_prefix", "fsm_heatpump")
+        self.listen_event(self._on_force_event, f"{prefix}_force_state")
+        self.listen_state(self._on_compressor_change, self._binary_compressor)
+        for sw in (self._switch_heating, self._switch_hot_water):
+            self.listen_state(self._on_wp_switch_change, sw)
+        if self._binary_defrost:
+            self.listen_state(
+                self._on_defrost_edge, self._binary_defrost, old="on", new="off"
+            )
+            self.listen_state(
+                self._on_defrost_start, self._binary_defrost, old="off", new="on"
+            )
+        if self._counter_defrost:
+            self.run_daily(self._reset_defrost_counter, "00:00:00")
+        self._apply_silent_mode()  # Start-Sync (z.B. nach AppDaemon-Neustart)
+
+    def _schedule_hot_water_windows(self):
+        h, m = self._parse_time(self._hw_morning_weekday)
+        self.run_daily(self._open_hw_window_if_werktag, f"{h:02d}:{m:02d}:00")
+        h, m = self._parse_time(self._hw_morning_weekend)
+        self.run_daily(self._open_hw_window_if_wochenende, f"{h:02d}:{m:02d}:00")
+        h, m = self._parse_time(self._hw_evening)
+        self.run_daily(self._open_hw_window, f"{h:02d}:{m:02d}:00")
+
+    # -------------------------------------------------------------------------
+    # Grundfos Pumpe
+    # -------------------------------------------------------------------------
+
+    def _pump_on(self):
+        """Grundfos Heizkreispumpe einschalten."""
+        if not self._switch_circuit2_pump:
+            return
+        if self._is_dry_run():
+            self.log("[DRY-RUN] _pump_on() -> kein Switch-Write", level="DEBUG")
+            return
+        try:
+            self.call_service("switch/turn_on", entity_id=self._switch_circuit2_pump)
+            self.log("[HP] Grundfos Pumpe EIN")
+        except Exception as e:
+            self.log(f"[HP] Pumpe EIN fehlgeschlagen: {e}", level="WARNING")
+
+    def _pump_off(self):
+        """Grundfos Heizkreispumpe ausschalten."""
+        if not self._switch_circuit2_pump:
+            return
+        if self._is_dry_run():
+            self.log("[DRY-RUN] _pump_off() -> kein Switch-Write", level="DEBUG")
+            return
+        try:
+            self.call_service("switch/turn_off", entity_id=self._switch_circuit2_pump)
+            self.log("[HP] Grundfos Pumpe AUS")
+        except Exception as e:
+            self.log(f"[HP] Pumpe AUS fehlgeschlagen: {e}", level="WARNING")
+
+    def _update_charge_heating(self):
+        """Grundfos + Mischer waehrend buffer_charge / buffer_charge_boost AT-abhaengig steuern.
+
+        Kalt (AT < Heizgrenze): Pumpe EIN + Mischer PI-Regler aktiv.
+          WP laedt Puffer (40002=1), Heizkreis wird parallel mit Pufferwaerme versorgt.
+          Der PI-Regler stellt den Mischer so, dass Heizkurven-Sollwert erreicht wird.
+        Warm (AT >= Heizgrenze): Pumpe AUS + Mischer geschlossen (Sommerbetrieb).
+
+        Idempotent: Pump-State und _mixer_handle werden geprueft, um unnoetige
+        Schaltaktionen und Timer-Neustarts bei jedem Sensor-Update zu vermeiden.
+        """
+        if not self._at_above_threshold():
+            # Pumpe: nur einschalten wenn aktuell aus
+            if self._switch_circuit2_pump:
+                pump_state = self.get_state(self._switch_circuit2_pump)
+                if pump_state != "on":
+                    self._pump_on()
+            # Mischer PI: nur starten wenn noch nicht aktiv
+            if self._mixer_handle is None:
+                sp = self._calc_flow_setpoint()
+                self._pi_prev_error = sp - self._flow_temp()
+                self._start_mixer_controller()
+        else:
+            # Pumpe: nur ausschalten wenn aktuell ein
+            if self._switch_circuit2_pump:
+                pump_state = self.get_state(self._switch_circuit2_pump)
+                if pump_state != "off":
+                    self._pump_off()
+            # Mischer: nur stoppen und schliessen wenn aktiv
+            if self._mixer_handle is not None:
+                self._stop_mixer_controller()
+                self._mixer_full_close()
+
+    def _update_circuit2_pv_shutoff(self, kwargs=None):
+        """Kreis-2-Pumpe im normalen Zustand 'heating' PV-bewusst abschalten.
+
+        _calc_flow_setpoint() enthaelt bereits die PV-Korrektur (Zeile ~1935).
+        Bleibt dieser Sollwert fuer circuit2_pv_off_delay_s unter
+        (vl_high - circuit2_pv_off_hyst_c), deckt die PV den Bedarf schon unter
+        Heizgrenzen-Niveau -> Kreis 2 kann pausieren, ohne Kreis 1/Kompressor
+        (Puffer/WW) zu beeinflussen. Wiedereinschalten schon ab vl_high (nicht
+        vl_high + hyst): der Heizkurvenanteil allein liegt in 'heating' immer
+        > vl_high (AT < heat_curve_at_high per Zustandsdefinition), die Schwelle
+        ist also ausser bei starker PV immer erreichbar. Hysterese sitzt deshalb
+        nur auf der Abschalt-Seite (Pendelschutz), nicht auf der Wiedereinschalt-
+        Seite - sonst bliebe die Pumpe knapp unterhalb der Heizgrenze dauerhaft
+        aus.
+        Sicherheitsseite: faellt der AT-Sensor aus (kein Cache, Startup-Default
+        30C) oder laeuft die Startup-Grace, wird nie pausiert und eine laufende
+        Pause sofort beendet - nie auf Default-/Fallback-Werten abschalten.
+        Nur im Zustand 'heating' aktiv - buffer_charge/boost haben mit
+        _update_charge_heating() bereits eine eigene (AT-basierte) Pumpensteuerung.
+        """
+        if self.state != "heating":
+            self._circuit2_below_vl_high_since = None
+            self._circuit2_pv_shutoff = False
+            return
+        if self._in_startup_grace() or self._outdoor_temp_cache is None:
+            self._circuit2_below_vl_high_since = None
+            if self._circuit2_pv_shutoff:
+                self._circuit2_pv_shutoff = False
+                self._pump_on()
+                self._pi_prev_error = self._calc_flow_setpoint() - self._flow_temp()
+                self._pi_position = self._pi_start_position()
+                self._start_mixer_controller()
+                self.log(
+                    "[HP] Kreis 2 PV-Pause Ende: AT-Sensor ohne Cache/Startup-Grace "
+                    "-> Pumpe/Mischer sicherheitshalber wieder AN"
+                )
+            return
+        vl_high = self._get_param("heat_curve_vl_high")
+        hyst = self._get_param("circuit2_pv_off_hyst_c")
+        sp = self._calc_flow_setpoint()
+        now = datetime.datetime.now()
+        if sp < vl_high - hyst:
+            if self._circuit2_below_vl_high_since is None:
+                self._circuit2_below_vl_high_since = now
+            elapsed = (now - self._circuit2_below_vl_high_since).total_seconds()
+            if (
+                not self._circuit2_pv_shutoff
+                and elapsed >= self._get_param("circuit2_pv_off_delay_s")
+            ):
+                self._circuit2_pv_shutoff = True
+                self._pump_off()
+                if self._mixer_handle is not None:
+                    self._stop_mixer_controller()
+                    self._mixer_full_close()
+                self.log(
+                    f"[HP] Kreis 2 PV-Pause: Sollwert={sp:.1f}C < vl_high-hyst="
+                    f"{vl_high - hyst:.1f}C seit {elapsed/60.0:.0f}min -> Pumpe/Mischer AUS"
+                )
+        else:
+            self._circuit2_below_vl_high_since = None
+            if self._circuit2_pv_shutoff and sp >= vl_high:
+                self._circuit2_pv_shutoff = False
+                self._pump_on()
+                self._pi_prev_error = sp - self._flow_temp()
+                self._pi_position = self._pi_start_position()
+                self._start_mixer_controller()
+                self.log(
+                    f"[HP] Kreis 2 PV-Pause Ende: Sollwert={sp:.1f}C >= "
+                    f"vl_high={vl_high:.1f}C -> Pumpe/Mischer wieder AN"
+                )
+
+    def _do_transition(self, t):
+        """Nach jedem Zustandswechsel Silent Mode sofort abgleichen (nicht erst
+        beim naechsten 60s-Tick) - deckt auch den Austritt aus buffer_charge/
+        buffer_charge_boost ab, nicht nur den Eintritt."""
+        super()._do_transition(t)
+        # Manuell erzwungenes WW (on_exit_hot_water hat das Flag bereits geloescht)
+        if t.to_state == "hot_water" and t.label.startswith("force"):
+            self._hw_manual = True
+            self.log("[HP] WW manuell erzwungen - bleibt bis 30006 >= Ziel oder manuellem Verlassen")
+        self._apply_silent_mode()
+
+    # -------------------------------------------------------------------------
+    # State Hooks
+    # -------------------------------------------------------------------------
+
+    def on_enter_heating(self):
+        self._heating_internal_stop = False
+        self._circuit2_below_vl_high_since = None
+        self._circuit2_pv_shutoff = False
+        self._pump_on()
+        sp = self._calc_flow_setpoint()
+        self._pi_prev_error = sp - self._flow_temp()
+        self._pi_position = self._pi_start_position()
+        self._start_mixer_controller()
+        if (
+            self.previous_state == "heating_forced"
+            and self._forced_lp_value is not None
+        ):
+            # Ramp-Down: 40003 bleibt auf forced-Wert, wird -1 deg/min zur Kurve abgesenkt.
+            # 40006 sofort auf Heizkurven-Sollwert (via _set_forced_setpoint).
+            forced_c1 = round(
+                self._forced_lp_value
+                + self._forced_setpoint_offset
+                + self._circuit1_offset,
+                1,
+            )
+            self._set_forced_setpoint(forced_c1)
+            self._start_c1_ramp(forced_c1)
+            self._decay_start_time = None
+        else:
+            # WP einschalten (Schalter/WW-aus); Kreis2 = Heizkurve.
+            self._set_wp_mode("heat", sp)
+            # Kreis1 (40003) folgt ab jetzt dynamisch dem WP-Auslass (LP-Tracking).
+            # _forced_lp_value frisch initialisieren (kein Ueberhang aus altem State).
+            self._forced_lp_value = None
+            self._decay_start_time = None
+            self._update_heating_setpoint()
+        self.log(
+            f"[HP] Heizung AN | Vorlauf-Soll: {sp:.1f}C | "
+            f"Puffer: 1/4={self._buffer_bottom():.1f} 1/2={self._buffer_mid():.1f} "
+            f"3/4={self._buffer_mid_high():.1f} oben={self._buffer_top():.1f}C"
+        )
+
+    def on_exit_heating(self):
+        self._cancel_c1_ramp()
+
+    def on_enter_hot_water(self):
+        self._pump_off()  # WW laeuft ueber Frischwasser-Waermetauscher, Heizkreis nicht noetig
+        # WW-Fenster sind morgens/abends - PV laeuft mittags -> kein Dual-Temperatur noetig.
+        # Puffer wurde tagsuebers per buffer_charge geladen; WW profitiert indirekt davon.
+        self._set_wp_mode("hot_water", self._ww_target)
+        self._stop_mixer_controller()
+        if self._pi_position > 1.0:
+            self._last_pi_position = self._pi_position  # Position merken, nicht fahren
+        self.log(
+            f"[HP] Warmwasser AN | 30006: {self._fmt_ww_temp()} / Ziel: {self._ww_target:.1f}C"
+            f" | Puffer oben: {self._buffer_top():.1f}C"
+        )
+
+    def on_exit_hot_water(self):
+        self._hw_manual = False  # Mischer bleibt auf eingefrorener Position
+
+    def on_enter_buffer_charge(self):
+        self._set_energy_state(3)
+        self._set_control_method(1)  # 40002=1: WP regelt auf Wassereinlass (30003)
+        # Sollwert = Einlass-Zieltemperatur: WP laeuft bis Puffer-Ruecklauf X°C erreicht.
+        # Wenn der Einlass (Ruecklauf vom Puffer-Unten) = 50°C ist, ist der gesamte Puffer >= 50°C.
+        self._set_wp_mode("buffer_charge", self._buffer_charge_inlet_temp)
+        # Grundfos + Mischer: AT-abhaengig (kalt -> parallel heizen, warm -> AUS)
+        self._update_charge_heating()
+        self._apply_silent_mode()
+        self.log(
+            f"[HP] PV-Pufferladung AN | 40002=1 (Einlass-Regelung) | "
+            f"Einlass-Soll: {self._buffer_charge_inlet_temp:.1f}C | "
+            f"Einlass-Ist: {self._raw_inlet_temp():.1f}C | PV: {self._pv_power_w()/1000:.1f} kW | "
+            f"AT: EMA={self._outdoor_temp():.1f}C 1h={self._outdoor_temp_1h():.1f}C ({'Pumpe EIN' if not self._at_above_threshold() else 'Pumpe AUS'})"
+        )
+
+    def on_exit_buffer_charge(self):
+        self._set_energy_state(2)
+        self._set_control_method(0)  # 40002=0: zurueck auf Wasserauslass-Regelung
+        if self._buffer_still_charged():
+            self._buffer_fully_charged = True
+        self.log(
+            f"[HP] PV-Ladung AUS | Puffer 1/2={self._buffer_mid():.1f}C "
+            f"restart_temp={self._charge_restart_temp():.1f}C "
+            f"-> vollgeladen={'JA' if self._buffer_fully_charged else 'NEIN'}"
+        )
+
+    def on_enter_buffer_charge_boost(self):
+        self._set_energy_state(self._boost_energy_state)
+        self._set_control_method(1)  # 40002=1 bleibt aktiv (Einlass-Regelung)
+        # Boost hebt Einlass-Ziel von buffer_charge_inlet_temp auf boost_inlet_temp.
+        # Der hoehere Sollwert zwingt WP+Heizstab laenger zu laufen.
+        self._set_wp_mode("buffer_charge", self._boost_inlet_temp)
+        # Grundfos + Mischer: AT-abhaengig (kalt -> parallel heizen, warm -> AUS)
+        self._update_charge_heating()
+        self._apply_silent_mode()
+        self.log(
+            f"[HP] Heizstab-Boost AN | Energiezustand={self._boost_energy_state} | "
+            f"Einlass-Soll={self._boost_inlet_temp}C | "
+            f"Einlass-Ist: {self._raw_inlet_temp():.1f}C | PV: {self._pv_power_w()/1000:.1f} kW | "
+            f"AT: EMA={self._outdoor_temp():.1f}C 1h={self._outdoor_temp_1h():.1f}C ({'Pumpe EIN' if not self._at_above_threshold() else 'Pumpe AUS'})"
+        )
+
+    def on_exit_buffer_charge_boost(self):
+        self._set_energy_state(2)
+        self._set_control_method(0)  # 40002=0: zurueck auf Wasserauslass-Regelung
+        if self._buffer_still_charged():
+            self._buffer_fully_charged = True
+        self.log(
+            f"[HP] Heizstab-Boost AUS | Puffer 1/2={self._buffer_mid():.1f}C "
+            f"restart_temp={self._charge_restart_temp():.1f}C "
+            f"-> vollgeladen={'JA' if self._buffer_fully_charged else 'NEIN'}"
+        )
+        # Zustand ist beim Exit-Hook noch "buffer_charge_boost" (self._state wird
+        # erst danach umgestellt) - _apply_silent_mode() hier wuerde also noch
+        # False liefern. Reconcile erfolgt zentral in _do_transition() nach
+        # dem Hook, sobald self._state auf den neuen Zustand zeigt.
+
+    def on_enter_heating_forced(self):
+        self._pump_on()
+        current = self._wp_leaving_temp()
+        self._forced_lp_value = current
+        self._last_forced_c1 = None  # Ratchet-Reset beim Eintritt
+        # Kreis 1 (40003): LP-Wert + Offset + Kreis1-Offset (haelt WP am Laufen)
+        # Kreis 2 (40006): normaler Heizkurven-Sollwert (kein Einfluss auf WP-Regelung)
+        forced_c1 = round(
+            min(
+                self._get_param("heat_curve_vl_low"),
+                current + self._forced_setpoint_offset + self._circuit1_offset,
+            ),
+            1,
+        )
+        self._last_forced_c1 = forced_c1
+        self._set_forced_setpoint(forced_c1)
+        # Mischer PI-Regler weiterlaufen lassen (Integral aus heating erhalten).
+        # _start_mixer_controller() stoppt ggf. alten Timer bevor neuer gestartet wird -
+        # noetig falls heating_forced per force_state direkt betreten wird.
+        self._start_mixer_controller()
+        if getattr(self, "_is_restart_enter", False):
+            # Neustart-Restore: WP lief bereits, Restlaufzeit unbekannt.
+            # Timer sofort ablaufen lassen - FSM kann direkt in heating/standby wechseln.
+            self._forced_end_time = datetime.datetime.now()
+            self.log(
+                f"[HP] Mindestlaufzeit (Neustart-Restore) | WP-Ausgang: {current:.1f}C "
+                f"-> Kreis1={forced_c1:.1f}C | Timer sofort abgelaufen"
+            )
+        else:
+            # Absoluten End-Timestamp berechnen: verbleibende Mindestlaufzeit ab jetzt.
+            already_run = self._compressor_runtime_minutes()
+            remaining = max(0.0, self._min_runtime_minutes - already_run)
+            self._forced_end_time = datetime.datetime.now() + datetime.timedelta(
+                minutes=remaining
+            )
+            self.log(
+                f"[HP] Mindestlaufzeit aktiv | WP-Ausgang: {current:.1f}C "
+                f"-> Kreis1={forced_c1:.1f}C | Puffer 1/2: {self._buffer_mid():.1f}C | "
+                f"Kompressor lief schon {already_run:.0f} min, "
+                f"Ende um {self._forced_end_time.strftime('%H:%M:%S')}"
+            )
+
+    def on_exit_heating_forced(self):
+        self._stop_mixer_controller()
+
+    def _enter_passive_state(self, close_mixer: bool = True) -> float:
+        """Gemeinsame Aktionen fuer idle/standby: WP+Pumpe aus,
+        Heizkurven-Sollwerte auf beide Kreise schreiben. Gibt den Sollwert zurueck.
+        close_mixer=False einfrieren (z.B. Standby nach heating_forced).
+        """
+        self._pump_off()
+        self._set_energy_state(2)
+        self._set_wp_mode("off", 0)
+        self._stop_mixer_controller()
+        if close_mixer:
+            self._mixer_full_close()
+        sp = self._calc_flow_setpoint_smoothed()
+        self._write_c2_direct(sp)
+        self._write_c1_direct(round(sp + self._circuit1_offset, 1))
+        return sp
+
+    def on_enter_standby(self):
+        # Mischer immer einfrieren: PI startet beim naechsten heating/buffer_drain
+        # von der letzten bekannten Position statt von 0% (vermeidet unnoetige Fahrt).
+        if self._pi_position > 1.0:
+            self._last_pi_position = self._pi_position
+        self._enter_passive_state(close_mixer=False)
+        self.log(f"[HP] Standby | Verdichterschutz {self._standby_minutes:.0f} min")
+
+    def on_enter_buffer_drain(self):
+        """Pufferwaerme ans Haus liefern, WP bleibt aus.
+        PI-Regler positioniert Mischer so, dass Heizkurven-Sollwert erreicht wird.
+        Wenn Puffer 1/2 unter threshold_on faellt -> Uebergang zu heating (WP startet).
+        """
+        self._pump_on()
+        self._set_energy_state(2)
+        self._set_wp_mode("off", 0)  # WP bleibt AUS
+        self._pi_position = self._pi_start_position()
+        sp = self._calc_flow_setpoint()
+        self._pi_prev_error = sp - self._flow_temp()
+        self._start_mixer_controller()
+        sp_s = self._calc_flow_setpoint_smoothed()
+        self._write_c2_direct(sp_s)
+        self._write_c1_direct(round(sp_s + self._circuit1_offset, 1))
+        self.log(
+            f"[HP] Puffer-Entladen | Kreis-2-Pumpe EIN, WP AUS | "
+            f"Vorlauf-Soll: {sp:.1f}C | "
+            f"Puffer 1/2: {self._buffer_mid():.1f}C 1/4: {self._buffer_bottom():.1f}C "
+            f"(Drain-Grenze 1/2: EIN>={self._buffer_drain_threshold_on():.1f}C aus idle/standby, "
+            f">={self._buffer_drain_threshold_off():.1f}C aus heating / AUS<{self._buffer_drain_threshold_on():.1f}C)"
+        )
+
+    def on_exit_buffer_drain(self):
+        self._stop_mixer_controller()
+
+    def on_enter_idle(self):
+        # Idle = echter Ruhezustand: Mischer schliesst. Position wird via _mixer_full_close
+        # in _last_pi_position gesichert, damit naechster heating/buffer_drain korrekt startet.
+        self._enter_passive_state(close_mixer=True)
+        self.log("[HP] Idle")
+
+    # -------------------------------------------------------------------------
+    # PI-Regler Mischer
+    # -------------------------------------------------------------------------
+
+    def _start_mixer_controller(self):
+        if self._mixer_handle is not None:
+            # Regler laeuft bereits (z.B. heating -> heating_forced / buffer_drain):
+            # nahtlos weiter, Trim-Integrator und Fahrhistorie bleiben erhalten.
+            self._mixer_ideal = self._pi_position
+            return
+        now = datetime.datetime.now()
+        self._mixer_ideal = self._pi_position
+        self._mixer_last_cmd_t = None
+        self._mixer_tank_f = self._mixer_rl_f = self._mixer_filter_t = None
+        # Nach laengerem Stillstand (Pumpe war aus) zeigt der RL-Fuehler veraltete Werte
+        # (Rohr warm, bis kaltes Heizkreiswasser ankommt, ~3 min). Feedforward und Trim-Init
+        # wuerden damit falsch vorbelegt -> Position halten, bis der Fuehler wieder stimmt.
+        stopped_s = (
+            None
+            if self._mixer_stopped_at is None
+            else (now - self._mixer_stopped_at).total_seconds()
+        )
+        # Kurze Unterbrechung (z.B. buffer_drain -> heating, Pumpe lief durch): Trim-Integrator
+        # behalten. Sonst bumpless: erster (nicht gehaltener) Step initialisiert den Trim so,
+        # dass Gesamtstellung = reale Position.
+        self._mixer_trim_init = not (stopped_s is not None and stopped_s < 120.0)
+        hold_s = self._get_param("mixer_start_hold_s")
+        if hold_s > 0.0 and (stopped_s is None or stopped_s >= 120.0):
+            self._mixer_hold_until = now + datetime.timedelta(seconds=hold_s)
+            self.log(
+                f"[Mischer] Start: Position {self._pi_position:.0f}% für {hold_s:.0f}s halten "
+                f"(RL-Fühler nach Pumpenstillstand veraltet)",
+                level="DEBUG",
+            )
+        else:
+            self._mixer_hold_until = None
+        self._mixer_handle = self.run_every(
+            self._mixer_pi_step, self.datetime(), self._mixer_interval_s
+        )
+
+    def _stop_mixer_controller(self):
+        if self._mixer_handle:
+            try:
+                self.cancel_timer(self._mixer_handle)
+            except Exception:
+                pass
+            self._mixer_handle = None
+            self._mixer_stopped_at = datetime.datetime.now()
+
+    def _mixer_filter_sensors(self, t_tank: float, t_rl: float) -> tuple[float, float]:
+        """Zeitbasierter Tiefpass (tau = mixer_sensor_tau_s) fuer die FF-Eingaenge.
+        Tank/RL haben 0.1-K-Aufloesung; ohne Filter kippt der FF-Wert (besonders bei
+        kleinem Tank-RL-Abstand) um ±1 %pt und der Mischer pendelt."""
+        now = datetime.datetime.now()
+        tau = self._get_param("mixer_sensor_tau_s")
+        if (
+            self._mixer_tank_f is None
+            or self._mixer_rl_f is None
+            or self._mixer_filter_t is None
+            or tau <= 0.0
+        ):
+            self._mixer_tank_f, self._mixer_rl_f = t_tank, t_rl
+        else:
+            dt = (now - self._mixer_filter_t).total_seconds()
+            if dt > 0.0:
+                a = 1.0 - math.exp(-dt / tau)
+                self._mixer_tank_f += a * (t_tank - self._mixer_tank_f)
+                self._mixer_rl_f += a * (t_rl - self._mixer_rl_f)
+        self._mixer_filter_t = now
+        return self._mixer_tank_f, self._mixer_rl_f
+
+    def _mixer_pi_step(self, kwargs):
+        if self.state not in (
+            "heating",
+            "buffer_drain",
+            "heating_forced",
+            "buffer_charge",
+            "buffer_charge_boost",
+        ):
+            return
+        if self._binary_defrost and self.get_state(self._binary_defrost) == "on":
+            self.log("[Mischer] Abtauen aktiv - PI-Regler pausiert", level="DEBUG")
+            return
+        raw_flow = self.get_state(self._sensor_flow_temp)
+        try:
+            float(raw_flow)
+        except (TypeError, ValueError):
+            if self._flow_temp_cache is None:
+                self.log(
+                    "[Mischer] Vorlauf-Sensor unavailable, kein Cache - PI pausiert",
+                    level="DEBUG",
+                )
+                return
+        setpoint = self._calc_flow_setpoint_smoothed()
+        actual = self._flow_temp()
+        e = setpoint - actual
+        # Totband Soll-Ist (Kreis 2): innerhalb ±db kein Trim-Eingriff, ausserhalb
+        # stetig um db verkuerzt (kein Sprung an der Bandgrenze).
+        e_db = self._get_param("mixer_error_db_c")
+        e_eff = 0.0 if abs(e) <= e_db else e - math.copysign(e_db, e)
+        kp = self._mixer_kp
+        ki = self._mixer_ki
+        limit = self._get_param("mixer_trim_limit_pct")
+
+        # --- Feedforward: invertierte Mischgleichung -------------------------
+        # VL = x*T_Tank + (1-x)*T_RL  ->  x = (VL_Soll - T_RL)/(T_Tank - T_RL)
+        # Nutzt aktuelle Messwerte -> kompensiert Verstaerkungs-Spreizung (ueber dT)
+        # und die RL-Rezirkulation direkt. Bei ungueltigen Fuehlern: letzten FF-Wert halten.
+        # Stetig ueber den ganzen Bereich: dT wird nur im Nenner nach unten auf
+        # mixer_dt_min begrenzt (Regularisierung). Frueher sprang der FF bei
+        # dT < dt_min hart auf 100 % -> Fahrt 50 -> 100 -> 50 bei jedem Tank-Tiefpunkt.
+        t_tank = self._sensor_value_or_none(
+            self._sensor_buffer_mid, "_buffer_mid_cache"
+        )
+        t_rl = self._mixer_return_temp()
+        ff_base = self._mixer_ff_base
+        if t_tank is not None and t_rl is not None:
+            t_tank, t_rl = self._mixer_filter_sensors(t_tank, t_rl)
+            if self._mixer_ff_enabled():
+                dt = t_tank - t_rl
+                dt_min = self._get_param("mixer_dt_min")
+                ratio = max(
+                    0.0,
+                    min(100.0, 100.0 * (setpoint - t_rl) / max(dt, dt_min, 0.1)),
+                )
+                # Ratio (physikalisches Mischverhaeltnis) -> noetige Stellposition
+                # ueber die gemessene Ventilkennlinie (siehe _VALVE_CAL).
+                ff_base = self._valve_position_for_ratio(ratio)
+        self._mixer_ff_base = ff_base
+
+        # --- Start-Haltezeit: RL-Fuehler noch veraltet -> nicht fahren, nicht init. ---
+        if self._mixer_hold_until is not None:
+            if datetime.datetime.now() < self._mixer_hold_until:
+                self.log(
+                    f"[Mischer] Halten bis {self._mixer_hold_until.strftime('%H:%M:%S')} | "
+                    f"Soll={setpoint:.1f}C Ist={actual:.1f}C FF={ff_base:.1f}%",
+                    level="DEBUG",
+                )
+                return
+            # Haltezeit vorbei: FF ist jetzt der Arbeitspunkt, Trim startet bei 0. Die
+            # gehaltene Position (Warmstart/alte Stellung) sagt nichts ueber den Trim aus:
+            # bumpless-Init brannte sonst 5-8 %pt Offset ein (Offsets von 5-8 %pt),
+            # den das Totband stundenlang stehen liess. Der Sprung zum FF laeuft ueber Slew/Gating.
+            self._mixer_hold_until = None
+            self._mixer_trim_i = 0.0
+            self._mixer_trim_init = False
+
+        # --- Bumpless-Init: Trim so, dass Gesamtstellung = reale Position ----
+        # Vorbelegung auf mixer_trim_init_max_pct begrenzt: ein unplausibler FF-Wert
+        # beim Start darf keinen grossen Trim-Offset einbrennen (Integrator ist langsam,
+        # T_i ~ 200 s bei kleinem e -> ein falscher Offset haelt Stunden).
+        if self._mixer_trim_init:
+            init_lim = min(limit, self._get_param("mixer_trim_init_max_pct"))
+            self._mixer_trim_i = max(
+                -init_lim, min(init_lim, self._pi_position - ff_base - kp * e_eff)
+            )
+            self._mixer_trim_init = False
+
+        # --- Langsamer PI-Trim auf das Residuum ------------------------------
+        total_unclamped = ff_base + kp * e_eff + self._mixer_trim_i + ki * e_eff
+        # Anti-Windup: nur integrieren wenn Ausgang nicht in Fehlerrichtung saturiert
+        if (
+            0.0 < total_unclamped < 100.0
+            or (total_unclamped <= 0.0 and e_eff > 0)
+            or (total_unclamped >= 100.0 and e_eff < 0)
+        ):
+            self._mixer_trim_i = max(
+                -limit, min(limit, self._mixer_trim_i + ki * e_eff)
+            )
+        trim = max(-limit, min(limit, kp * e_eff + self._mixer_trim_i))
+
+        # --- Slew-Limit (Stellantrieb 123s Vollhub) + Clamp -> Ideal-Stellung -----
+        u_raw = max(0.0, min(100.0, ff_base + trim))
+        max_step = self._get_param("mixer_max_step_pct")
+        ideal = max(
+            0.0,
+            min(
+                100.0,
+                self._mixer_ideal + max(-max_step, min(max_step, u_raw - self._mixer_ideal)),
+            ),
+        )
+        self._mixer_ideal = ideal
+
+        # --- Ausgabe-Gating: wenige, groessere Fahrten statt 1-%-Pendeln ------------
+        # Fahrbefehl nur wenn |Ideal - zuletzt kommandiert| >= mixer_move_db_pct UND
+        # seit dem letzten Fahrbefehl mixer_min_move_s vergangen sind. Grosse
+        # Abweichungen (>= mixer_big_move_pct) duerfen den Mindestabstand umgehen;
+        # Endanschlaege (0/100 %) werden auch unterhalb des Totbands angefahren.
+        old_pos = self._pi_position
+        now = datetime.datetime.now()
+        since = (
+            float("inf")
+            if self._mixer_last_cmd_t is None
+            else (now - self._mixer_last_cmd_t).total_seconds()
+        )
+        diff = ideal - old_pos
+        move_db = self._get_param("mixer_move_db_pct")
+        min_gap = self._get_param("mixer_min_move_s")
+        big = self._get_param("mixer_big_move_pct")
+        at_stop = (ideal <= 0.5 and old_pos > 0.5) or (ideal >= 99.5 and old_pos < 99.5)
+        move = (
+            round(ideal) != round(old_pos)
+            and (abs(diff) >= move_db or at_stop)
+            and (abs(diff) >= big or since >= min_gap)
+        )
+        new_pos = ideal if move else old_pos
+        self.log(
+            f"[Mischer] Soll={setpoint:.1f}C Ist={actual:.1f}C e={e:+.1f}C(eff {e_eff:+.1f}) | "
+            f"FF={ff_base:.1f}% Trim={trim:+.1f}%(I={self._mixer_trim_i:+.1f}) | "
+            f"Ideal={ideal:.1f}% Pos: {old_pos:.1f}%->{new_pos:.1f}%"
+            f"{'' if move else ' (gehalten)'}",
+            level="DEBUG",
+        )
+        if move:
+            self._pi_position = new_pos
+            self._mixer_last_cmd_t = now
+            self._set_cover_position(new_pos)
+            self._write_pi_position(new_pos)
+
+    def _set_cover_position(self, position: float):
+        if not self._cover_mixer:
+            return
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] _set_cover_position({position:.0f}%) -> kein cover-Write",
+                level="DEBUG",
+            )
+            return
+        try:
+            self.call_service(
+                "cover/set_cover_position",
+                entity_id=self._cover_mixer,
+                position=round(position),
+            )
+        except Exception as e:
+            self.log(f"[Mischer] cover setzen fehlgeschlagen: {e}", level="WARNING")
+
+    def _cover_position_actual(self) -> float:
+        """Aktuelle physische Mischer-Position aus HA lesen (Fallback: 50%)."""
+        if not self._cover_mixer:
+            return 50.0
+        try:
+            pos = self.get_state(self._cover_mixer, attribute="current_position")
+            if pos is not None:
+                return float(pos)
+        except Exception:
+            pass
+        return 50.0
+
+    def _write_pi_position(self, position: float):
+        """PI-Soll-Position in HA schreiben (Dashboard-Visualisierung)."""
+        if not self._input_pi_position:
+            return
+        try:
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_pi_position,
+                value=round(position, 1),
+            )
+        except Exception as e:
+            self.log(
+                f"[Mischer] PI-Position schreiben fehlgeschlagen: {e}", level="WARNING"
+            )
+
+    def _pi_start_position(self) -> float:
+        """PI-Startposition: actual wenn Mischer offen und kein aktiver Close-Vorgang,
+        sonst letzte bekannte Gleichgewichtsposition, sonst Warmstart-Default.
+        _mixer_was_closed verhindert, dass eine noch laufende close-Bewegung (time_based Cover
+        braucht bis zu 125 s) als valide Startposition gewertet wird."""
+        actual = self._cover_position_actual()
+        use_last = actual < 1.0 or self._mixer_was_closed
+        self._mixer_was_closed = False  # einmalig konsumieren
+        if use_last:
+            start = (
+                self._last_pi_position
+                if self._last_pi_position is not None
+                else self._get_param("mixer_warmstart_position")
+            )
+            self._set_cover_position(start)
+            self._write_pi_position(start)
+            self.log(
+                f"[Mischer] PI-Start: actual={actual:.0f}% last_pi="
+                f"{'%.0f%%' % self._last_pi_position if self._last_pi_position is not None else 'None'}"
+                f" was_closed={use_last} -> start={start:.0f}%",
+                level="DEBUG",
+            )
+            return start
+        self.log(
+            f"[Mischer] PI-Start: actual={actual:.0f}% (Cover offen, kein Close-Flag) -> direkt übernommen",
+            level="DEBUG",
+        )
+        return actual
+
+    def _mixer_full_open(self):
+        """Mischer vollstaendig oeffnen mit 2s Ueberfahren zum Positions-Reset."""
+        self._pi_position = 100.0
+        self._write_pi_position(100.0)
+        self._set_cover_position(100.0)
+        if self._cover_mixer and not self._is_dry_run():
+            self.run_in(
+                lambda _: self.call_service(
+                    "cover/open_cover", entity_id=self._cover_mixer
+                ),
+                self._mixer_full_travel_s + 2,
+            )
+        else:
+            self.log(
+                "[DRY-RUN] _mixer_full_open() Überfahren -> kein cover-Write",
+                level="DEBUG",
+            )
+
+    def _mixer_full_close(self):
+        """Mischer vollstaendig schliessen mit 2s Ueberfahren zum Positions-Reset."""
+        if self._pi_position > 1.0:
+            self._last_pi_position = self._pi_position
+        self._mixer_was_closed = True  # Signal fuer _pi_start_position: Cover evtl. noch in Bewegung
+        self._pi_position = 0.0
+        self._pi_prev_error = 0.0
+        self._write_pi_position(0.0)
+        self._set_cover_position(0.0)
+        if self._cover_mixer and not self._is_dry_run():
+            self.run_in(
+                lambda _: self.call_service(
+                    "cover/close_cover", entity_id=self._cover_mixer
+                ),
+                self._mixer_full_travel_s + 2,
+            )
+        else:
+            self.log(
+                "[DRY-RUN] _mixer_full_close() Überfahren -> kein cover-Write",
+                level="DEBUG",
+            )
+
+    # -------------------------------------------------------------------------
+    # Heartbeat-Log
+    # -------------------------------------------------------------------------
+
+    def _log_state_heartbeat(self, kwargs):
+        """Alle 10 min: aktueller Zustand + warum kein Zustandswechsel (Debugging)."""
+        state = self.state
+        at_ema = self._outdoor_temp()
+        at_1h = self._outdoor_temp_1h()
+        thr = self._heating_threshold
+        mid = self._buffer_mid()
+        thr_on = self._buffer_drain_threshold_on()
+        mins = self.minutes_in_state()
+
+        def yn(cond: bool) -> str:
+            return "JA" if cond else "nein"
+
+        msg = f"[HP] HB {state} ({mins:.0f}min)"
+
+        if state in ("buffer_drain", "idle", "standby", "heating", "heating_forced"):
+            heat = self._need_heating()
+            drain = self._need_buffer_drain()
+            # Entry: EMA; Exit: 1h-Mittelwert
+            msg += (
+                f" | AT_EMA={at_ema:.1f}C AT_1h={at_1h:.1f}C(Grenze={thr:.1f})"
+                f" | Puf1/2={mid:.1f}C(DrainAN>={self._buffer_drain_entry_threshold():.1f} AUS<{thr_on:.1f})"
+            )
+            above = self._at_above_threshold()
+            if state == "buffer_drain":
+                msg += (
+                    f" | ->heat:{yn(heat)}"
+                    f"(EMA<{thr:.1f}:{yn(at_ema<thr)} 1h<{thr:.1f}:{yn(at_1h<thr)} Puf<{thr_on:.1f}:{yn(mid<thr_on)})"
+                    f" | ->idle:{yn(above)}"
+                    f"(EMA>={thr:.1f}:{yn(at_ema>=thr)} oder 1h>={thr:.1f}:{yn(at_1h>=thr)})"
+                )
+            elif state in ("idle", "standby"):
+                charge = self._should_charge_buffer()
+                msg += (
+                    f" | ->heat:{yn(heat)} ->drain:{yn(drain)} ->charge:{yn(charge)}"
+                )
+            elif state in ("heating", "heating_forced"):
+                comp = self._compressor_on_since is not None
+                rt = self._compressor_runtime_minutes()
+                min_rt = self._min_runtime_minutes
+                forced_ok = state == "heating_forced" and self._forced_time_elapsed()
+                msg += (
+                    f" | Komp={'EIN' if comp else 'AUS'} {rt:.0f}/{min_rt:.0f}min"
+                    f" | ->standby:{yn(above and (not comp or rt >= min_rt))}"
+                    f"(EMA>={thr:.1f}:{yn(at_ema>=thr)} oder 1h>={thr:.1f}:{yn(at_1h>=thr)})"
+                )
+                if state == "heating_forced":
+                    msg += f" | Mindestlaufzeit-Ende: {yn(forced_ok)}"
+
+        elif state in ("buffer_charge", "buffer_charge_boost"):
+            inlet = self._raw_inlet_temp()
+            pv_rest = self._pv_energy_kwh()
+            charge_ok = self._should_charge_buffer()
+            target = self._boost_inlet_temp if state == "buffer_charge_boost" else self._buffer_charge_inlet_temp
+            msg += (
+                f" | Einlass={inlet:.1f}C(Ziel={target:.1f})"
+                f" | Puf1/2={self._buffer_mid():.1f}C(restart<{self._charge_restart_temp():.1f})"
+                f" | PV={self._pv_power_w()/1000:.1f}kW(min {self._get_param('pv_charge_min_w')/1000:.1f})"
+                f" | PV-Rest={pv_rest:.1f}kWh"
+                f" | vollgeladen={yn(self._buffer_fully_charged)}"
+                f" | Ladebedingung:{yn(charge_ok)}"
+            )
+
+        elif state == "hot_water":
+            msg += (
+                f" | WW-Fenster={'aktiv' if self._hw_window_active else 'inaktiv'}"
+                f" | 30006={self._fmt_ww_temp()}/Ziel={self._ww_target:.1f}C"
+                f" | Oben={self._buffer_top():.1f}C"
+                f"{' | manuell' if self._hw_manual else ''}"
+            )
+
+        if self._hw_window_active and state != "hot_water":
+            msg += (
+                f" | WW-Fenster aktiv, 30006={self._fmt_ww_temp()}"
+                f"(WW-Modus<{self._ww_start_threshold():.1f})"
+            )
+
+        self.log(msg)
+
+    # -------------------------------------------------------------------------
+    # Bedingungsfunktionen
+    # -------------------------------------------------------------------------
+
+    def _in_startup_grace(self) -> bool:
+        """True fuer startup_grace_seconds nach (Neu-)Start. In diesem Fenster wird
+        keine WP-Abschalt-Transition ausgefuehrt - Schutz waehrend Backup-Neustart (~02:05)."""
+        if self._startup_grace_s <= 0:
+            return False
+        return (
+            datetime.datetime.now() - self._startup_time
+        ).total_seconds() < self._startup_grace_s
+
+    def _at_above_threshold(self) -> bool:
+        """Exit-Bedingung: kein Heizbedarf wenn EMA *oder* AT_1h ueber Heizgrenze.
+        Pendant zu _need_heating(): dort EMA UND 1h unter Grenze (Entry); hier EMA ODER 1h drueber (Exit).
+
+        Eine WP-Abschaltung wird NIE auf Default-/Ratewerten getroffen:
+        - Waehrend Startup-Grace -> False (nicht abschalten).
+        - Wenn ein AT-Sensor unavailable ist und kein gueltiger Cache existiert
+          (-> _sensor_value_or_none() liefert None) -> False (AT unbekannt, nicht abschalten).
+        Verhindert Fehl-Abschaltung nach Container-Neustart, wenn der 1h-Statistics-Sensor
+        noch unavailable ist und sonst auf 30C ('warm') defaulten wuerde.
+        """
+        if self._in_startup_grace():
+            return False
+        ema = self._sensor_value_or_none(
+            self._sensor_outdoor_temp, "_outdoor_temp_cache"
+        )
+        h1 = self._sensor_value_or_none(
+            self._sensor_outdoor_temp_1h, "_outdoor_temp_1h_cache"
+        )
+        if ema is None or h1 is None:
+            return False
+        thr = self._heating_threshold
+        return ema >= thr or h1 >= thr
+
+    def _need_heating(self) -> bool:
+        # buffer_mid (1/2) als Schaltpunkt: zeigt ob genuegend Waerme fuer Drain/Haus vorhanden.
+        # In heating: off-Schwelle (on + hyst) verhindert Pendeln.
+        # Aus idle/standby/drain: on-Schwelle triggert WP-Start.
+        # Entry-Bedingung prueft BEIDE AT-Sensoren: EMA (traege, Entry-Schutz) UND 1h (schnell).
+        # Verhindert standby->heating->standby-Bounce wenn AT_1h bereits warm aber EMA noch kalt.
+        if not self._buffer_mid_valid():
+            return False  # Puffer 1/2 noch unbekannt (Neustart) -> Zustand halten
+        threshold = (
+            self._buffer_drain_threshold_off()
+            if self.state == "heating"
+            else self._buffer_drain_threshold_on()
+        )
+        return (
+            self._outdoor_temp() < self._heating_threshold
+            and self._outdoor_temp_1h() < self._heating_threshold
+            and self._buffer_mid() < threshold
+        )
+
+    def _ww_start_threshold(self) -> float:
+        """30006 unter diesem Wert -> WW-Modus im WW-Fenster (= LG-Einschaltpunkt)."""
+        return self._ww_target - self._get_param("ww_lg_hysteresis")
+
+    def _need_hot_water(self) -> bool:
+        """WW-Vorrang nur wenn die LG im WW-Fenster auch tatsaechlich laedt: Einschaltpunkt
+        der LG ist 30006 < ww_target - ww_lg_hysteresis. Darueber bleibt der aktuelle Zustand
+        (z.B. heating laeuft weiter). Ein Einstieg allein nach Puffer oben wuerde auch dann
+        in hot_water wechseln, wenn die LG nicht laedt -> Heizung steht.
+        Fuehlerausfall (30006 unbekannt): WW-Modus wie bisher (sichere Seite).
+        """
+        if not self._hw_window_active or self._vacation_active():
+            return False
+        ww = self._ww_temp()
+        return ww is None or ww < self._ww_start_threshold()
+
+    def _hw_target_reached(self) -> bool:
+        """30006 >= ww_target -> hot_water verlassen (Fenster und manuell). Abschalt-
+        Entscheidung: bei unbekanntem 30006 nie (Fensterende/Zeitlimit greifen)."""
+        ww = self._ww_temp()
+        return ww is not None and ww >= self._ww_target
+
+    def _need_buffer_drain(self) -> bool:
+        """Puffer hat noch genug Waerme, AT kalt - Pumpe liefert Pufferwaerme ans Haus.
+        WP bleibt aus. Uebergang zu heating wenn Puffer 1/2 < Sollwert + buffer_drain_margin.
+        Einstiegs-Schwelle zustandsabhaengig, siehe _buffer_drain_entry_threshold().
+
+        Verwendet buffer_mid (1/2) statt buffer_bottom (1/4): Nach PV-Ladung oder
+        Heizzyklen ist der Pufferboden oft kalt (Ruecklauf), waehrend die oberen Zonen
+        noch ausreichend Waerme fuer den Heizkreis haben.
+        """
+        if not self._buffer_mid_valid():
+            return False  # Puffer 1/2 noch unbekannt (Neustart) -> Zustand halten
+        return (
+            self._outdoor_temp() < self._heating_threshold
+            and self._outdoor_temp_1h() < self._heating_threshold
+            and self._buffer_mid() >= self._buffer_drain_entry_threshold()
+        )
+
+    def _should_charge_buffer(self) -> bool:
+        """Puffer laden wenn PV verfuegbar und Einlass noch unter Zieltemperatur.
+        Mit 40002=1 (Wassereinlass-Regelung) zeigt der Einlass-Sensor (30003) ob der
+        gesamte Puffer bereits geladen ist - kein separater Tank-Sensor noetig.
+
+        Hysterese nach erfolgreicher Ladung: _buffer_fully_charged verhindert Neustart,
+        bis Puffer 1/2 < (buffer_charge_inlet_temp - buffer_charge_hyst) faellt.
+        Start nur bei PV-Leistung >= pv_charge_min_w (nicht allein nach Prognose).
+
+        Benutzt _raw_inlet_temp() (ohne WP-Pumpen-Guard): WP laeuft hier noch nicht,
+        der Sensor zeigt zuverlaessig die Puffertemperatur. _wp_inlet_temp() wuerde 0 liefern.
+        Urlaubsmodus: keine PV-Ladung.
+        """
+        if self._vacation_active():
+            return False
+        if self._buffer_fully_charged:
+            if self._buffer_still_charged():
+                return False
+            self._buffer_fully_charged = False
+            self.log(
+                f"[HP] Puffer-Hysterese: Puffer 1/2 {self._buffer_mid():.1f}C < "
+                f"{self._charge_restart_temp():.1f}C -> Ladung wieder möglich",
+                level="INFO",
+            )
+
+        inlet = self._raw_inlet_temp()
+        pv_rest = self._pv_energy_kwh()
+        return (
+            self._pv_in_solar_window()
+            and self._pv_power_w() >= self._get_param("pv_charge_min_w")
+            and pv_rest >= self._pv_buffer_min_kwh  # genug Restmenge vorhanden
+            and pv_rest < self._pv_buffer_max_kwh  # Nachmittags-Fenster: nicht zu frueh
+            and inlet
+            < self._buffer_charge_inlet_temp  # Puffer noch nicht voll (Einlass)
+            and self._buffer_bottom()
+            < self._buffer_charge_inlet_temp  # Tank 1/4 als Vorcheck (pumpenunabhaengig)
+        )
+
+    def _charge_restart_temp(self) -> float:
+        return self._buffer_charge_inlet_temp - self._get_param("buffer_charge_hyst")
+
+    def _buffer_still_charged(self) -> bool:
+        """Puffer 1/2 >= Neustart-Schwelle. Unbekannt (nach Neustart) zaehlt als geladen."""
+        mid = self._sensor_value_or_none(self._sensor_buffer_mid, "_buffer_mid_cache")
+        return mid is None or mid >= self._charge_restart_temp()
+
+    def _update_boost_pv_stability(self, kwargs=None):
+        """60-s-Tick, zustandsunabhaengig: merkt sich seit wann PV ununterbrochen
+        >= boost_pv_min_w liegt. Grundlage fuer die Stabilitaets-Sperre in _should_boost
+        (verhindert Boost-Start durch kurze PV-Spitzen)."""
+        if self._pv_power_w() >= self._boost_pv_min_w:
+            if self._boost_pv_stable_since is None:
+                self._boost_pv_stable_since = datetime.datetime.now()
+        else:
+            self._boost_pv_stable_since = None
+
+    def _boost_pv_stable_minutes_elapsed(self) -> float:
+        if self._boost_pv_stable_since is None:
+            return 0.0
+        return (
+            datetime.datetime.now() - self._boost_pv_stable_since
+        ).total_seconds() / 60
+
+    def _should_boost(self) -> bool:
+        """Boost aktivieren wenn PV stark genug und Einlass-Temp noch unter Boost-Ziel.
+        boost_inlet_min_c: Mindest-Einlass bevor Boost startet (Puffer muss schon warm sein).
+        Mit 40002=1: Boost hebt Einlass-Ziel von buffer_charge_inlet_temp auf boost_inlet_temp.
+        PV muss zudem boost_pv_stable_minutes ununterbrochen stabil sein (_update_boost_pv_stability).
+        """
+        if self._vacation_active():
+            return False
+        if self._binary_defrost:
+            if self.get_state(self._binary_defrost) == "on":
+                return False
+        if not self._in_boost_window():
+            return False
+        if (
+            self._boost_pv_stable_minutes_elapsed()
+            < self._get_param("boost_pv_stable_minutes")
+        ):
+            return False
+        if (
+            self._wp_inlet_temp() < self._boost_inlet_min_c
+        ):  # Puffer noch zu kalt fuer Boost
+            return False
+        if (
+            self._wp_inlet_temp() >= self._boost_inlet_temp
+        ):  # Boost-Ziel bereits erreicht
+            return False
+        return True
+
+    def _should_stop_boost(self) -> bool:
+        """Harte Gruende (Abtauen, Fensterende) beenden Boost sofort. Der weiche Grund
+        (PV zu schwach) greift erst nach boost_min_minutes Mindestlaufzeit.
+        Urlaubsmodus zaehlt als harter Grund."""
+        if self._vacation_active():
+            return True
+        if self._binary_defrost:
+            if self.get_state(self._binary_defrost) == "on":
+                return True
+        if not self._in_boost_window():
+            return True
+        if self.minutes_in_state() < self._get_param("boost_min_minutes"):
+            return False
+        if self._pv_power_w() < self._boost_pv_off_w:
+            return True
+        return False
+
+    def _in_boost_window(self) -> bool:
+        now = datetime.datetime.now().time()
+        try:
+            start_h, start_m = self._parse_time(self._boost_window_start)
+            end_h, end_m = self._parse_time(self._boost_window_end)
+            start = datetime.time(start_h, start_m)
+            end = datetime.time(end_h, end_m)
+            return start <= now < end
+        except Exception:
+            return self._pv_in_solar_window()
+
+    def _compressor_runtime_minutes(self) -> float:
+        if self._compressor_on_since is None:
+            return 0.0
+        return (
+            datetime.datetime.now() - self._compressor_on_since
+        ).total_seconds() / 60
+
+    def _standby_done(self) -> bool:
+        return self.minutes_in_state() >= self._standby_minutes
+
+    def _forced_time_elapsed(self) -> bool:
+        """True wenn die Verdichter-Mindestlaufzeit in heating_forced abgelaufen ist.
+        Bevorzugt den absoluten End-Zeitstempel (_forced_end_time), faellt auf die
+        Verweildauer im Zustand zurueck falls dieser nicht gesetzt wurde.
+        """
+        if self._forced_end_time is not None:
+            return datetime.datetime.now() >= self._forced_end_time
+        return self.minutes_in_state() >= self._min_runtime_minutes
+
+    def _pv_in_solar_window(self) -> bool:
+        """PV-Fenster fuer Pufferladung und WW-Temperaturwahl.
+        Nutzt dasselbe Zeitfenster wie boost_window (apps.yaml: boost_window_start/end).
+        """
+        return self._in_boost_window()
+
+    # -------------------------------------------------------------------------
+    # Heizkurve
+    # -------------------------------------------------------------------------
+
+    def _pv_kw_smoothed(self) -> float:
+        """PV-Leistung [kW] mit zusaetzlicher zeitbasierter EMA (tau = pv_smooth_minutes).
+
+        sensor.pv_produktion_15m ist bereits ein 15-min-Mittelwert; Wolkendurchzuege
+        liessen den Kreis-2-Sollwert (PV-Korrektur) trotzdem um bis zu ~1 K schwanken
+        und damit den Mischer fahren. Die EMA ist zeitbasiert (alpha = 1-exp(-dt/tau)),
+        also unabhaengig davon, wie oft sie aufgerufen wird. Start/Neustart: aktueller Wert.
+        """
+        now = datetime.datetime.now()
+        pv_kw = self._pv_power_w() / 1000.0
+        tau_s = max(0.0, self._get_param("pv_smooth_minutes")) * 60.0
+        if self._pv_ema_kw is None or self._pv_ema_t is None or tau_s <= 0.0:
+            self._pv_ema_kw = pv_kw
+        else:
+            dt = (now - self._pv_ema_t).total_seconds()
+            if dt > 0.0:
+                self._pv_ema_kw += (1.0 - math.exp(-dt / tau_s)) * (pv_kw - self._pv_ema_kw)
+        self._pv_ema_t = now
+        return self._pv_ema_kw
+
+    def _calc_flow_setpoint(self, with_pv_correction: bool = True) -> float:
+        """Heizkurven-Sollwert (ohne Sollwert-EWMA). Die PV-Korrektur nutzt die
+        geglaettete PV-Leistung (_pv_kw_smoothed). Schwellen-Berechnungen (buffer_drain)
+        rufen ohne PV-Korrektur auf - instant response auf AT/Parameter."""
+        at_high = self._get_param("heat_curve_at_high")
+        vl_high = self._get_param("heat_curve_vl_high")
+        at_low = self._get_param("heat_curve_at_low")
+        vl_low = self._get_param("heat_curve_vl_low")
+        at = self._outdoor_temp()
+        slope = (vl_low - vl_high) / (at_high - at_low)
+        base = vl_high + (at_high - at) * slope
+        if with_pv_correction:
+            base -= self._pv_kw_smoothed() * self._pv_correction_per_kw
+        if self._vacation_active():
+            # Absenkung gilt auch fuer die Schwellen (buffer_drain/heating), damit die
+            # WP nicht gegen einen hoeheren Bezug arbeitet als der Mischer regelt.
+            base -= self._get_param("vacation_setback_k")
+        return max(18.0, min(60.0, base))
+
+    def _calc_flow_setpoint_smoothed(self) -> float:
+        """Gedaempfter Sollwert fuer Mischer-Regler und 40006-Writes (PV-Glaettung
+        siehe _pv_kw_smoothed; hier zusaetzlich ein kurzer zeitbasierter EWMA,
+        tau = setpoint_tau_s, gegen Spruenge bei Parameteraenderungen).
+        Zeitbasiert statt 'alpha pro Aufruf': die Aufrufhaeufigkeit (Mischer 5 s,
+        dazu Sensor-Events) darf die Zeitkonstante nicht veraendern.
+        Schwellen-Berechnungen nutzen _calc_flow_setpoint() (ohne Daempfung)."""
+        raw = self._calc_flow_setpoint()
+        now = datetime.datetime.now()
+        tau = self._get_param("setpoint_tau_s")
+        if self._setpoint_ewma is None or self._setpoint_ewma_t is None or tau <= 0.0:
+            self._setpoint_ewma = raw
+        else:
+            dt = (now - self._setpoint_ewma_t).total_seconds()
+            if dt > 0.0:
+                self._setpoint_ewma += (1.0 - math.exp(-dt / tau)) * (raw - self._setpoint_ewma)
+        self._setpoint_ewma_t = now
+        return self._setpoint_ewma
+
+    # -------------------------------------------------------------------------
+    # WP-Steuerung
+    # -------------------------------------------------------------------------
+
+    def _set_wp_mode(self, mode: str, temp: float = 0.0):
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] _set_wp_mode(mode={mode!r}, temp={temp}C) -> kein Modbus-Write",
+                level="INFO",
+            )
+            return
+        try:
+            if mode == "off":
+                self._wp_switch(self._switch_heating, False)
+                self._wp_switch(self._switch_hot_water, False)
+                self._log_wp_mode("[HP] Modbus -> Heizung OFF, WW OFF")
+
+            elif mode == "heat":
+                c1 = round(temp + self._circuit1_offset, 1)
+                self._wp_switch(self._switch_hot_water, False)
+                self.call_service(
+                    "input_number/set_value",
+                    entity_id=self._input_setpoint_circuit2,
+                    value=round(temp, 1),
+                )
+                self.call_service(
+                    "input_number/set_value",
+                    entity_id=self._input_setpoint_circuit1,
+                    value=c1,
+                )
+                self._wp_switch(self._switch_heating, True)
+                self._log_wp_mode(
+                    f"[HP] Modbus -> Heizung ON, Kreis2={round(temp,1)}C Kreis1={c1}C"
+                )
+
+            elif mode == "buffer_charge":
+                self._wp_switch(self._switch_hot_water, False)
+                self.call_service(
+                    "input_number/set_value",
+                    entity_id=self._input_setpoint_circuit1,
+                    value=round(temp, 1),
+                )
+                self._wp_switch(self._switch_heating, True)
+                self._log_wp_mode(f"[HP] Modbus -> PV-Ladung ON, Kreis1={round(temp,1)}C")
+
+            elif mode == "hot_water":
+                self._wp_switch(self._switch_heating, False)
+                self.call_service(
+                    "input_number/set_value",
+                    entity_id=self._input_setpoint_ww,
+                    value=round(temp, 1),
+                )
+                self._wp_switch(self._switch_hot_water, True)
+                self._log_wp_mode(f"[HP] Modbus -> WW ON, WW-Soll={round(temp,1)}C")
+
+        except Exception as e:
+            self.log(f"[HP] Modbus-Steuerung fehlgeschlagen: {e}", level="WARNING")
+
+    def _wp_switch(self, entity: str, on: bool):
+        """Coil 10001/10002 schreiben und den Sollzustand für den Abgleich merken."""
+        self._wp_switch_expected[entity] = "on" if on else "off"
+        self.call_service("switch/turn_on" if on else "switch/turn_off", entity_id=entity)
+
+    def _on_wp_switch_change(self, entity, attribute, old, new, kwargs):
+        """Poll liefert einen anderen Coil-Wert als den zuletzt geschriebenen (Gerät hat ihn
+        zurückgesetzt, Write verworfen oder Fremdzugriff). Beispiel: nach internem Stopp
+        liest der Poll 10001 = on, die LG heizt in buffer_drain weiter."""
+        expected = self._wp_switch_expected.get(entity)
+        if expected is None or new not in ("on", "off") or new == expected:
+            return
+        if self._is_dry_run():
+            return
+        self.log(
+            f"[HP] WARNUNG: {entity} = '{new}', FSM erwartet '{expected}' "
+            f"(Zustand '{self.state}', Gerät/Fremdzugriff) – schreibe erneut",
+            level="WARNING",
+        )
+        self.run_in(
+            self._reassert_wp_switch,
+            self._get_param("wp_switch_reassert_delay_s"),
+            entity=entity,
+        )
+
+    def _reassert_wp_switch(self, kwargs):
+        entity = kwargs["entity"]
+        expected = self._wp_switch_expected.get(entity)
+        if expected is None or self._is_dry_run() or self.get_state(entity) == expected:
+            return
+        now = datetime.datetime.now()
+        window = datetime.timedelta(minutes=self._get_param("wp_switch_reassert_window_minutes"))
+        while self._wp_switch_reasserts and now - self._wp_switch_reasserts[0] >= window:
+            self._wp_switch_reasserts.popleft()
+        if not self._wp_switch_reasserts:
+            self._wp_switch_alarm = False
+        limit = int(self._get_param("wp_switch_reassert_max"))
+        if len(self._wp_switch_reasserts) >= limit:
+            if not self._wp_switch_alarm:
+                self._wp_switch_alarm = True
+                msg = (
+                    f"{entity} weicht nach {limit} Nachschreib-Versuchen weiter ab "
+                    f"(Soll '{expected}', Zustand '{self.state}'). LG-Bedienteil/Fremdzugriff prüfen."
+                )
+                self.log(f"[HP] ! COIL-ABGLEICH: {msg}", level="ERROR")
+                try:
+                    self.call_service(
+                        "persistent_notification/create",
+                        title="! WP-Schalter weicht ab",
+                        message=msg,
+                        notification_id="fsm_wp_switch",
+                    )
+                except Exception as e:
+                    self.log(f"[HP] Benachrichtigung fehlgeschlagen: {e}", level="WARNING")
+            return
+        self._wp_switch_reasserts.append(now)
+        self.log(f"[HP] Coil-Abgleich: {entity} → '{expected}' erneut geschrieben")
+        try:
+            self._wp_switch(entity, expected == "on")
+        except Exception as e:
+            self.log(f"[HP] Coil-Abgleich fehlgeschlagen: {e}", level="WARNING")
+
+    def _log_wp_mode(self, msg: str):
+        if msg != self._last_wp_mode_log:
+            self.log(msg)
+            self._last_wp_mode_log = msg
+
+    def _write_c1_direct(self, c1: float):
+        """Schreibt nur Kreis 1 (40003), laesst Kreis 2 (40006) unveraendert."""
+        if self._is_dry_run():
+            self.log(f"[DRY-RUN] _write_c1_direct({c1:.1f}C)", level="INFO")
+            return
+        try:
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_setpoint_circuit1,
+                value=round(c1, 1),
+            )
+        except Exception as e:
+            self.log(f"[HP] Kreis1-Write fehlgeschlagen: {e}", level="WARNING")
+
+    def _write_c2_direct(self, c2: float):
+        """Schreibt nur Kreis 2 (40006), laesst Kreis 1 (40003) unveraendert."""
+        if self._is_dry_run():
+            self.log(f"[DRY-RUN] _write_c2_direct({c2:.1f}C)", level="INFO")
+            return
+        try:
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_setpoint_circuit2,
+                value=round(c2, 1),
+            )
+        except Exception as e:
+            self.log(f"[HP] Kreis2-Write fehlgeschlagen: {e}", level="WARNING")
+
+    def _start_c1_ramp(self, from_c1: float):
+        """Startet Ramp-Down fuer Kreis 1 (40003): -1 deg/min bis Heizkurven-Sollwert."""
+        self._cancel_c1_ramp()
+        target_c1 = round(self._calc_flow_setpoint_smoothed() + self._circuit1_offset, 1)
+        if from_c1 <= target_c1:
+            return  # bereits am/unter Ziel
+        self._ramp_c1_current = from_c1
+        self._ramp_c1_handle = self.run_every(self._ramp_c1_step, self.datetime(), 60)
+        self.log(
+            f"[HP] Kreis1 Ramp-Down: {from_c1:.1f}C -> {target_c1:.1f}C (-1 deg/min)"
+        )
+
+    def _ramp_c1_step(self, kwargs):
+        """Timer-Callback: 40003 um 1 deg/min absenken bis Heizkurven-Sollwert erreicht."""
+        del kwargs  # AppDaemon-Pflichtparameter, inhaltlich nicht benoetigt
+        if self.state != "heating" or self._ramp_c1_current is None:
+            self._cancel_c1_ramp()
+            return
+        target_c1 = round(self._calc_flow_setpoint_smoothed() + self._circuit1_offset, 1)
+        self._ramp_c1_current -= 1.0
+        if self._ramp_c1_current <= target_c1:
+            self._cancel_c1_ramp()
+            # Ramp-Down beendet: ab jetzt dynamisches LP-Tracking (wie normales heating).
+            # _forced_lp_value und Decay-State frisch initialisieren.
+            self._forced_lp_value = None
+            self._decay_start_time = None
+            self._update_heating_setpoint()
+            self.log(
+                f"[HP] Kreis1 Ramp-Down abgeschlossen -> dynamisches Tracking aktiv"
+            )
+        else:
+            self._write_c1_direct(self._ramp_c1_current)
+            self.log(
+                f"[HP] Kreis1 Ramp-Down: {self._ramp_c1_current:.1f}C (Ziel: {target_c1:.1f}C)",
+                level="DEBUG",
+            )
+
+    def _cancel_c1_ramp(self):
+        """Kreis-1-Ramp-Down abbrechen und Zustand zuruecksetzen."""
+        if self._ramp_c1_handle:
+            try:
+                self.cancel_timer(self._ramp_c1_handle)
+            except Exception:
+                pass
+            self._ramp_c1_handle = None
+        self._ramp_c1_current = None
+
+    def _update_heating_setpoint(self, raw: float | None = None):
+        """LP-Tracking fuer Kreis 1 (40003) im heating-Zustand.
+
+        Phase 1 (<min_runtime): LP folgt WP-Auslass bidirektional; Untergrenze
+        Kreis1 = Heizkurven-Sollwert (Kreis2), damit Kreis1 nie darunter faellt.
+        Phase 2 (>=min_runtime UND Puffer 1/2 >= Drain-Schwelle aus heating): Kreis1 faellt
+        linear 1 C/10 min zurueck auf den Heizkurven-Sollwert -> WP stoppt intern
+        (Auslass > Kreis1 + 4 C). Ohne die Puffer-Bedingung stoppt die LG teils
+        knapp unter der Schwelle -> FSM blieb in heating, Neustart
+        nach ~20 min. Einmal begonnen, laeuft die Absenkung weiter (kein Pendeln), ausser
+        Puffer 1/2 faellt unter die on-Schwelle -> Abbruch, zurueck ins Tracking.
+        Startmodus (Verdichter aus, Restart-Pause vorbei): Kreis1 = Puffer 1/4 +
+        heating_start_margin_c, Untergrenze Kurve + circuit1_offset. Der LG-Auslass ist
+        im Stillstand veraltet und Kurve + 1 K liegt zu nah am Wasser -> LG startet nicht.
+        Obergrenze in allen Phasen: heat_curve_vl_low.
+        Kreis 2 (40006) bleibt der Heizkurven-Sollwert.
+        """
+        if raw is None:
+            raw = self._wp_leaving_temp()
+        curve_sp = self._calc_flow_setpoint_smoothed()
+        if self._heating_start_mode():
+            self._write_heating_start_setpoint(curve_sp)
+            return
+        min_elapsed = (
+            self._compressor_runtime_minutes() >= self._min_runtime_minutes
+        )
+        # LP-Untergrenze so dass Kreis1 = curve_sp + circuit1_offset wenn LP = lp_floor:
+        # raw_c1 = lp_floor + forced_setpoint_offset + circuit1_offset = curve_sp + circuit1_offset
+        lp_floor = curve_sp - self._forced_setpoint_offset
+
+        if (
+            self._decay_start_time is not None
+            and self._buffer_mid_valid()
+            and self._buffer_mid() < self._buffer_drain_threshold_on()
+        ):
+            # Abbruch: Puffer 1/2 waehrend der Absenkung unter die on-Schwelle gefallen ->
+            # die gedrosselte WP liefert weniger als das Haus braucht (Puffer sinkt waehrend der
+            # Absenkung an der Untergrenze). Zurueck ins Tracking (Phase 1);
+            # neue Absenkung erst wieder ab der off-Schwelle.
+            self._decay_start_time = None
+            self.log(
+                f"[HP] Absenkung abgebrochen: Puffer 1/2 {self._buffer_mid():.1f}C < "
+                f"{self._buffer_drain_threshold_on():.1f}C (on-Schwelle) -> Tracking"
+            )
+
+        if self._forced_lp_value is None:
+            # Init: LP mindestens so hoch dass Kreis1 >= Kurve
+            self._forced_lp_value = max(raw, lp_floor)
+            self._decay_start_time = None
+        elif min_elapsed and (
+            self._decay_start_time is not None
+            or self._buffer_mid() >= self._buffer_drain_threshold_off()
+        ):
+            # Phase 2: linearer Rueckgang 1 C / 10 min bis Heizkurven-Sollwert
+            if self._decay_start_time is None:
+                self._decay_start_time = datetime.datetime.now()
+                self._decay_lp_start = self._forced_lp_value
+            elapsed_min = (
+                datetime.datetime.now() - self._decay_start_time
+            ).total_seconds() / 60.0
+            lp_decayed = self._decay_lp_start - elapsed_min / 10.0
+            self._forced_lp_value = max(lp_floor, lp_decayed)
+        elif self._defrost_lp_hold():
+            # Phase 1 beim Abtauen + defrost_lp_hold_minutes danach: LP eingefroren
+            self._decay_start_time = None
+            self._forced_lp_value = max(lp_floor, self._forced_lp_value)
+        else:
+            # Phase 1: bidirektionaler LP-Filter; Untergrenze = Heizkurve
+            self._decay_start_time = None
+            lp = (
+                self._forced_lp_alpha * raw
+                + (1 - self._forced_lp_alpha) * self._forced_lp_value
+            )
+            self._forced_lp_value = max(lp_floor, lp)
+
+        raw_c1 = (
+            self._forced_lp_value + self._forced_setpoint_offset + self._circuit1_offset
+        )
+        # Hard-Limit: Mitkopplungs-Hochlauf verhindern (max. Auslegungstemperatur)
+        c1 = round(min(self._get_param("heat_curve_vl_low"), raw_c1), 1)
+        self._write_c2_direct(curve_sp)
+        self._write_c1_direct(c1)
+        if min_elapsed and self._decay_start_time is not None:
+            elapsed = (
+                datetime.datetime.now() - self._decay_start_time
+            ).total_seconds() / 60.0
+            mode = f"decay({elapsed:.1f}min)"
+        else:
+            mode = "track"
+        self.log(
+            f"[HP] heating Sollwert({mode}): LP={self._forced_lp_value:.2f}C "
+            f"-> Kreis1={c1:.1f}C (raw={raw:.1f}C, Kurve={curve_sp:.1f}C, "
+            f"cap={self._get_param('heat_curve_vl_low'):.0f}C)",
+            level="DEBUG",
+        )
+
+    def _defrost_lp_hold(self) -> bool:
+        """True waehrend Abtauen und defrost_lp_hold_minutes nach dessen Ende.
+        Das Ende kommt aus _on_defrost_edge; zusaetzlich wird es bei jedem Aufruf mit
+        aktivem Abtauen nachgezogen (robust, falls die Flanke verpasst wurde)."""
+        if not self._binary_defrost:
+            return False
+        now = datetime.datetime.now()
+        if self.get_state(self._binary_defrost) == "on":
+            self._defrost_ended_at = now
+            return True
+        if self._defrost_ended_at is None:
+            return False
+        hold_min = self._get_param("defrost_lp_hold_minutes")
+        return (now - self._defrost_ended_at).total_seconds() / 60.0 < hold_min
+
+    def _heating_start_mode(self) -> bool:
+        """Verdichter aus und Restart-Pause nach dem letzten AUS abgelaufen."""
+        if self._compressor_on_since is not None:
+            return False
+        if self._compressor_off_since is None:
+            return True
+        paused_min = (
+            datetime.datetime.now() - self._compressor_off_since
+        ).total_seconds() / 60.0
+        return paused_min >= self._get_param("heating_restart_pause_minutes")
+
+    def _write_heating_start_setpoint(self, curve_sp: float):
+        """Startmodus: Kreis1 = Puffer 1/4 + Marge, damit die LG anlaeuft.
+        LP-Wert wird passend gesetzt -> Phase 1 uebernimmt nach Verdichterstart stossfrei."""
+        cap = self._get_param("heat_curve_vl_low")
+        c1 = curve_sp + self._circuit1_offset
+        bottom = self._sensor_value_or_none(
+            self._sensor_buffer_bottom, "_buffer_bottom_cache"
+        )
+        if bottom is not None:
+            c1 = max(c1, bottom + self._get_param("heating_start_margin_c"))
+        c1 = round(min(cap, c1), 1)
+        self._forced_lp_value = c1 - self._forced_setpoint_offset - self._circuit1_offset
+        self._decay_start_time = None
+        self._write_c2_direct(curve_sp)
+        self._write_c1_direct(c1)
+        bottom_txt = f"{bottom:.1f}C" if bottom is not None else "n/a"
+        self.log(
+            f"[HP] heating Sollwert(start): Kreis1={c1:.1f}C (Puffer1/4={bottom_txt}, "
+            f"Marge={self._get_param('heating_start_margin_c'):.1f}K, Kurve={curve_sp:.1f}C, "
+            f"cap={cap:.0f}C)",
+            level="DEBUG",
+        )
+
+    def _set_forced_setpoint(self, forced_c1: float):
+        """Schreibt heating_forced Sollwerte:
+        Kreis 1 (40003): forced_c1 (LP-Wert + Offset, haelt WP am Laufen)
+        Kreis 2 (40006): aktueller Heizkurven-Sollwert (wie heating, kein Einfluss auf WP-Regelung)
+        """
+        curve_sp = self._calc_flow_setpoint_smoothed()
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] _set_forced_setpoint: Kreis1={forced_c1:.1f}C Kreis2={curve_sp:.1f}C",
+                level="INFO",
+            )
+            return
+        try:
+            self._wp_switch(self._switch_hot_water, False)
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_setpoint_circuit2,
+                value=round(curve_sp, 1),
+            )
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_setpoint_circuit1,
+                value=round(forced_c1, 1),
+            )
+            self._wp_switch(self._switch_heating, True)
+            self.log(
+                f"[HP] Modbus -> Heizung ON (forced) | "
+                f"Kreis1={forced_c1:.1f}C Kreis2={curve_sp:.1f}C (Kurve)"
+            )
+        except Exception as e:
+            self.log(f"[HP] Modbus-Steuerung fehlgeschlagen: {e}", level="WARNING")
+
+    def _set_energy_state(self, state: int):
+        if not self._input_energy_state:
+            return
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] _set_energy_state({state}) -> kein Modbus-Write",
+                level="INFO",
+            )
+            return
+        try:
+            self.call_service(
+                "input_number/set_value",
+                entity_id=self._input_energy_state,
+                value=state,
+            )
+            self.log(f"[HP] Energiezustand -> {state}", level="DEBUG")
+        except Exception as e:
+            self.log(f"[HP] Energiezustand setzen fehlgeschlagen: {e}", level="WARNING")
+
+    def _set_control_method(self, method: int):
+        """Steuermethode Register 40002 direkt per Modbus schreiben.
+        0 = Wasserauslass-Regelung (Default, normaler Heizbetrieb)
+        1 = Wassereinlass-Regelung (buffer_charge/boost: WP regelt auf Ruecklauf-Temp)
+        Direkter Write ohne input_number Bridge, da kein Dashboard-Helper noetig.
+        """
+        label = "Wassereinlass (1)" if method == 1 else "Wasserauslass (0)"
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] _set_control_method({method} / {label}) -> kein Modbus-Write",
+                level="INFO",
+            )
+            return
+        try:
+            self.call_service(
+                "modbus/write_register",
+                hub=self._modbus_hub,
+                slave=self._modbus_slave,
+                address=1,  # 40002 = Holding-Register Index 1 (0-basiert von 40001)
+                value=method,
+            )
+            self.log(f"[HP] Modbus 40002 -> {label}")
+        except Exception as e:
+            self.log(f"[HP] Steuermethode setzen fehlgeschlagen: {e}", level="WARNING")
+
+    def _desired_silent_mode(self) -> bool:
+        """Silent Mode ist pauschal aktiv. Ausnahmen (volle Leistung gewuenscht):
+        - buffer_charge/buffer_charge_boost: WP soll Puffer zuegig laden.
+        - Nach Abtauende: fuer silent_mode_defrost_hold_h Stunden aus, damit die
+          WP sich schneller erholt und seltener in den naechsten Abtauzyklus
+          rutscht (im Winter taut sie haeufig ab, dort wirkt das am meisten).
+        """
+        if self._state in ("buffer_charge", "buffer_charge_boost"):
+            return False
+        if self._silent_override_until and datetime.datetime.now() < self._silent_override_until:
+            return False
+        return True
+
+    def _apply_silent_mode(self, kwargs=None):
+        self._set_silent_mode(self._desired_silent_mode())
+
+    def _on_defrost_start(self, entity, attribute, old, new, kwargs):
+        """Zaehlt Abtauzyklen (Flanke off->on). hp_defrost_count ist ein
+        HA-Counter-Helper, taeglich um Mitternacht zurueckgesetzt; hp_defrost_count_total
+        laeuft unbegrenzt weiter (Basis fuer die Langzeitstatistik via Template-Sensor,
+        siehe fsm_heatpump.yaml). Beide ueberleben AppDaemon-Neustarts (restore: true)."""
+        for counter in (self._counter_defrost, self._counter_defrost_total):
+            if not counter:
+                continue
+            try:
+                self.call_service("counter/increment", entity_id=counter)
+            except Exception as e:
+                self.log(
+                    f"[HP] Abtauen-Zähler ({counter}) erhöhen fehlgeschlagen: {e}",
+                    level="ERROR",
+                )
+
+    def _reset_defrost_counter(self, kwargs):
+        if not self._counter_defrost:
+            return
+        try:
+            self.call_service("counter/reset", entity_id=self._counter_defrost)
+        except Exception as e:
+            self.log(f"[HP] Abtauen-Zähler zurücksetzen fehlgeschlagen: {e}", level="ERROR")
+
+    def _on_defrost_edge(self, entity, attribute, old, new, kwargs):
+        self._defrost_ended_at = datetime.datetime.now()  # Kreis-1-Sperre (heating Phase 1)
+        hold_h = self._get_param("silent_mode_defrost_hold_h")
+        self._silent_override_until = datetime.datetime.now() + datetime.timedelta(
+            hours=hold_h
+        )
+        self.log(
+            f"[HP] Abtauen beendet -> Silent Mode für {hold_h:.1f}h deaktiviert"
+        )
+        self._apply_silent_mode()
+        self.run_in(self._apply_silent_mode, int(hold_h * 3600))
+
+    def _set_silent_mode(self, enable: bool):
+        if not self._switch_silent_mode:
+            return
+        raw = self.get_state(self._switch_silent_mode)
+        if raw not in ("on", "off"):
+            return  # Sensor (noch) nicht verfuegbar - naechster Tick versucht es erneut
+        current = raw == "on"
+        if current == enable:
+            return
+        if self._is_dry_run():
+            self.log(
+                f"[DRY-RUN] Silent Mode -> {'EIN' if enable else 'AUS'}", level="INFO"
+            )
+            return
+        try:
+            service = "switch/turn_on" if enable else "switch/turn_off"
+            self.call_service(service, entity_id=self._switch_silent_mode)
+            self.log(f"[HP] Silent Mode -> {'EIN' if enable else 'AUS'}")
+        except Exception as e:
+            self.log(f"[HP] Silent Mode setzen fehlgeschlagen: {e}", level="WARNING")
+
+    def _sync_modbus_setpoints(self, kwargs=None):
+        """Zyklischer Modbus-Write fuer 40003/40006.
+        Stellt sicher, dass die Register nach FSM-Neustart korrekt stehen, auch wenn
+        input_number sich nicht geaendert hat (HA-Automation triggert nur bei State-Change).
+        """
+        if self._is_dry_run():
+            return
+        try:
+            for entity_id, address in (
+                (self._input_setpoint_circuit1, 2),  # 40003
+                (self._input_setpoint_circuit2, 5),  # 40006
+            ):
+                raw = self.get_state(entity_id)
+                if raw in (None, "unavailable", "unknown"):
+                    continue
+                self.call_service(
+                    "modbus/write_register",
+                    hub=self._modbus_hub,
+                    slave=self._modbus_slave,
+                    address=address,
+                    value=int(float(raw) * 10),
+                )
+            self.log("[HP] Modbus-Sync 40003/40006 OK", level="DEBUG")
+        except Exception as e:
+            self.log(f"[HP] Modbus-Sync fehlgeschlagen: {e}", level="WARNING")
+
+    # -------------------------------------------------------------------------
+    # Callbacks
+    # -------------------------------------------------------------------------
+
+    def _on_sensor_change(self, entity, attribute, old, new, kwargs):
+        self.evaluate_transitions()
+        # Sollwerte haengen nur von AT und PV ab - nur bei diesen Sensoren neu schreiben.
+        setpoint_relevant = entity in (
+            self._sensor_outdoor_temp,
+            self._sensor_pv_power_w,
+        )
+        if self.state == "heating":
+            if self._ramp_c1_current is None and setpoint_relevant:
+                # Kreis2 (40006) folgt der Heizkurve; Kreis1 (40003) bleibt
+                # dynamisches LP-Tracking (Ratchet erhalten, nicht statisch ueberschreiben).
+                self._update_heating_setpoint()
+            # else: Ramp-Down aktiv - 40003 wird von _ramp_c1_step gesteuert
+        elif self.state == "heating_forced" and setpoint_relevant:
+            # Kreis2 (40006) auf aktuelle Heizkurve halten; Kreis1 via _on_wp_leaving_temp_change
+            self._write_c2_direct(self._calc_flow_setpoint_smoothed())
+        elif self.state == "buffer_drain" and setpoint_relevant:
+            sp = self._calc_flow_setpoint_smoothed()
+            self._write_c2_direct(sp)
+            self._write_c1_direct(round(sp + self._circuit1_offset, 1))
+        elif self.state in ("buffer_charge", "buffer_charge_boost"):
+            self._update_charge_heating()
+
+    def _on_param_change(self, entity, attribute, old, new, kwargs):
+        self.log(f"[HP] Parameter geändert: {entity} = {new}", level="INFO")
+        self.evaluate_transitions()
+        if self.state == "heating" and self._ramp_c1_current is None:
+            self._update_heating_setpoint()
+        elif self.state == "heating_forced":
+            self._write_c2_direct(self._calc_flow_setpoint_smoothed())
+        elif self.state == "buffer_drain":
+            sp = self._calc_flow_setpoint_smoothed()
+            self._write_c2_direct(sp)
+            self._write_c1_direct(round(sp + self._circuit1_offset, 1))
+
+    def _on_wp_leaving_temp_change(self, entity, attribute, old, new, kwargs):
+        if self.state not in ("heating", "heating_forced"):
+            return
+        try:
+            raw = float(new)
+        except (TypeError, ValueError):
+            return
+        if self.state == "heating":
+            # Im heating: Kreis1 dynamisch tracken, ABER nur wenn kein Ramp-Down
+            # laeuft (Ramp-Down steuert 40003 selbst via _ramp_c1_step).
+            if self._ramp_c1_current is None:
+                self._update_heating_setpoint(raw)
+            return
+        if self._forced_lp_value is None:
+            self._forced_lp_value = raw
+        else:
+            self._forced_lp_value = (
+                self._forced_lp_alpha * raw
+                + (1 - self._forced_lp_alpha) * self._forced_lp_value
+            )
+        raw_c1 = (
+            self._forced_lp_value + self._forced_setpoint_offset + self._circuit1_offset
+        )
+        # Hard-Limit: Mitkopplungs-Hochlauf verhindern
+        capped_c1 = min(self._get_param("heat_curve_vl_low"), raw_c1)
+        # Ratchet: waehrend Mindestlaufzeit nur steigende Werte zulassen (Anti-Abschalt)
+        if self._last_forced_c1 is not None:
+            forced_c1 = round(max(capped_c1, self._last_forced_c1), 1)
+        else:
+            forced_c1 = round(capped_c1, 1)
+        self._last_forced_c1 = forced_c1
+        self._write_c1_direct(
+            forced_c1
+        )  # nur Kreis1 tracken; Kreis2 via _on_sensor_change
+        self.log(
+            f"[HP] heating_forced Sollwert: LP={self._forced_lp_value:.2f}C "
+            f"-> Kreis1={forced_c1:.1f}C (raw={raw:.1f}C, cap={self._get_param('heat_curve_vl_low'):.0f}C)",
+            level="DEBUG",
+        )
+
+    def _on_compressor_change(self, entity, attribute, old, new, kwargs):
+        if new == "on":
+            self._heating_internal_stop = False
+            self._compressor_on_since = datetime.datetime.now()
+            self._compressor_starts.append(datetime.datetime.now())
+            self._check_compressor_cycling()
+            if self.state == "heating":
+                self.log("[HP] Kompressor EIN - Mindestlaufzeit-Timer läuft")
+            elif self.state not in ("heating_forced", "hot_water") and not self.state.startswith(
+                "buffer_charge"
+            ):
+                self.log(
+                    f"[HP] WARNUNG: Kompressor EIN im Zustand '{self.state}' - FSM fordert keine Wärme an "
+                    f"({self._switch_heating}={self.get_state(self._switch_heating)}, "
+                    f"{self._switch_hot_water}={self.get_state(self._switch_hot_water)})",
+                    level="WARNING",
+                )
+        elif new == "off":
+            if self.state == "heating" and self._compressor_on_since is not None:
+                # Laufzeit vor dem Loeschen von _compressor_on_since auswerten
+                self._heating_internal_stop = (
+                    self._compressor_runtime_minutes() >= self._min_runtime_minutes
+                )
+            self._compressor_on_since = None
+            self._compressor_off_since = datetime.datetime.now()
+        if new == "off" and self.state in ("heating", "heating_forced"):
+            self.log(
+                f"[HP] WARNUNG: Kompressor AUS im Zustand '{self.state}' - "
+                "WP hat intern abgeschaltet (Störung / Abtauen?) "
+                f"[{self._switch_heating}={self.get_state(self._switch_heating)}]",
+                level="WARNING",
+            )
+            if self._heating_internal_stop:
+                self.log(
+                    "[HP] Interner Stopp nach Mindestlaufzeit: buffer_drain ab Puffer 1/2 >= "
+                    f"{self._buffer_drain_threshold_on():.1f}C (on-Schwelle), "
+                    f"Puffer 1/2 jetzt {self._buffer_mid():.1f}C"
+                )
+            if self.state == "heating":
+                # Kreis1 sofort zurueck auf berechneten Sollwert: sauberer Start fuer naechsten Zyklus
+                sp = self._calc_flow_setpoint_smoothed()
+                self._write_c1_direct(round(sp + self._circuit1_offset, 1))
+                self._write_c2_direct(sp)
+            # Transitions sofort pruefen: forced_end_time koennte bereits ueberschritten sein
+            self.evaluate_transitions()
+
+    def _check_compressor_cycling(self):
+        """Verdichter-Takt-Schutz: warnt wenn zu viele Starts in kurzer Zeit.
+        Fenster: cycling_window_minutes, Limit: cycling_max_starts.
+        Loest Dry-Run aus wenn Limit ueberschritten (schont Verdichter)."""
+        window_min = self._get_param("cycling_window_minutes")
+        max_starts = int(self._get_param("cycling_max_starts"))
+        cutoff = datetime.datetime.now() - datetime.timedelta(minutes=window_min)
+        while self._compressor_starts and self._compressor_starts[0] < cutoff:
+            self._compressor_starts.popleft()
+        count = len(self._compressor_starts)
+        if count >= max_starts:
+            self.log(
+                f"[HP] ! TAKT-SCHUTZ: {count} Verdichter-Starts in {window_min:.0f} min "
+                f"(Limit: {max_starts}). Dry-Run aktiviert.",
+                level="ERROR",
+            )
+            self._compressor_starts.clear()
+            if self._dry_run_entity:
+                try:
+                    self.call_service(
+                        "input_boolean/turn_on", entity_id=self._dry_run_entity
+                    )
+                    self.call_service(
+                        "persistent_notification/create",
+                        title="! WP Takt-Schutz ausgelöst",
+                        message=(
+                            f"{count} Verdichter-Starts in {window_min:.0f} min. "
+                            "Dry-Run aktiviert. Ursache prüfen, dann Dry-Run manuell deaktivieren."
+                        ),
+                        notification_id="fsm_cycling",
+                    )
+                except Exception as e:
+                    self.log(
+                        f"[HP] Takt-Schutz aktivieren fehlgeschlagen: {e}",
+                        level="ERROR",
+                    )
+        elif count >= max(2, max_starts - 2):
+            self.log(
+                f"[HP] WARNUNG: {count}/{max_starts} Verdichter-Starts in {window_min:.0f} min",
+                level="WARNING",
+            )
+
+    def _check_heating_stall(self, kwargs):
+        """Watchdog: Kompressor bleibt in heating/heating_forced ueber
+        heating_stall_minutes AUS, obwohl VL-Soll deutlich (>= heating_stall_error_c)
+        ueber VL-Ist liegt -> die FSM fordert Waerme an, die WP liefert aber keine.
+        Ursache liegt dann ausserhalb der FSM (z.B. Kreis 1 am LG-Geraet deaktiviert,
+        interne Stoerung, Notbetrieb) - die FSM kann das nicht beheben, nur melden.
+        Einmalige Meldung pro Ereignis (Reset sobald der Kompressor wieder anspringt
+        oder der Zustand wechselt)."""
+        if self.state not in ("heating", "heating_forced"):
+            if self._heating_stall_notified:
+                self._heating_stall_notified = False
+                self._dismiss_heating_stall_notification()
+            return
+        if self._compressor_on_since is not None:
+            if self._heating_stall_notified:
+                self._heating_stall_notified = False
+                self.log("[HP] Heizungs-Stillstand behoben - Kompressor läuft wieder")
+                self._dismiss_heating_stall_notification()
+            return
+        if self._heating_stall_notified:
+            return
+        stall_min = self._get_param("heating_stall_minutes")
+        mins = self.minutes_in_state()
+        if mins < stall_min:
+            return
+        setpoint = self._calc_flow_setpoint_smoothed()
+        actual = self._flow_temp()
+        if actual is None:
+            return
+        err_min = self._get_param("heating_stall_error_c")
+        if setpoint - actual < err_min:
+            return
+        self._heating_stall_notified = True
+        msg = (
+            f"Zustand '{self.state}' seit {mins:.0f} min, Kompressor läuft nicht "
+            f"(VL-Soll {setpoint:.1f}C, Ist {actual:.1f}C, e={setpoint - actual:+.1f}C). "
+            "LG-Gerät/Display prüfen (Kreis 1 evtl. deaktiviert, Fehlercode, Notbetrieb)."
+        )
+        self.log(f"[HP] ! HEIZUNG STEHT: {msg}", level="ERROR")
+        try:
+            self.call_service(
+                "persistent_notification/create",
+                title="! WP heizt nicht",
+                message=msg,
+                notification_id="fsm_heating_stall",
+            )
+        except Exception as e:
+            self.log(f"[HP] Heizungs-Stillstand persistent_notification fehlgeschlagen: {e}", level="ERROR")
+
+    def _dismiss_heating_stall_notification(self):
+        try:
+            self.call_service(
+                "persistent_notification/dismiss", notification_id="fsm_heating_stall"
+            )
+        except Exception as e:
+            self.log(f"[HP] Heizungs-Stillstand-Dismiss fehlgeschlagen: {e}", level="ERROR")
+
+    def _on_aux_heater_change(self, entity, attribute, old, new, kwargs):
+        state_name = "EIN" if new == "on" else "AUS"
+        heater_num = "1" if entity == self._binary_aux_heater_1 else "2"
+        self.log(
+            f"[HP] Heizstab Stufe {heater_num} {state_name} | FSM-Zustand: {self.state}",
+            level="INFO",
+        )
+        if new == "on" and self.state not in ("buffer_charge_boost", "hot_water"):
+            self.log(
+                f"[HP] INFO: Heizstab im Zustand '{self.state}' aktiv "
+                f"(typisch beim Abtauen oder WW-Boost - DIP begrenzt auf 3 kW)",
+                level="INFO",
+            )
+
+    def _on_force_event(self, event_name, data, kwargs):
+        target = data.get("state")
+        if target:
+            self.force_state(target, reason=f"Event: {event_name}")
+
+    def _on_vacation_change(self, entity, attribute, old, new, kwargs):
+        if new not in ("on", "off") or old == new:
+            return
+        if new == "on":
+            self.log(
+                f"[HP] Urlaubsmodus EIN: WW im Fenster, PV-Ladung und PV-Boost gesperrt, Heizkurve "
+                f"Kreis 2 -{self._get_param('vacation_setback_k'):.1f} K "
+                f"(Zustand '{self.state}')",
+                level="INFO",
+            )
+        else:
+            self.log(
+                f"[HP] Urlaubsmodus AUS: WW, PV-Ladung, PV-Boost und Heizkurve Kreis 2 wieder normal "
+                f"(Zustand '{self.state}')",
+                level="INFO",
+            )
+        # Gleiche Folgeaktionen wie bei Parameteraenderung: Uebergaenge pruefen und
+        # den (jetzt verschobenen) Heizkurven-Sollwert sofort schreiben.
+        self._on_param_change(entity, attribute, old, new, kwargs)
+        # Faellt das Ende des Urlaubs in ein offenes WW-Fenster, startet WW sofort
+        # (_need_hot_water prueft das Fenster), sonst beim naechsten Fenster.
+
+    def _on_dry_run_change(self, entity, attribute, old, new, kwargs):
+        if new == "on":
+            self.log(
+                "[DRY-RUN] *** SIMULATIONSMODUS AKTIV *** FSM rechnet, aber kein Modbus-Write!",
+                level="WARNING",
+            )
+        else:
+            self.log(
+                f"[DRY-RUN] *** SIMULATIONSMODUS BEENDET *** FSM-Zustand: {self.state} - Modbus-Writes aktiv",
+                level="WARNING",
+            )
+            self._apply_current_state()
+
+    def _apply_current_state(self):
+        s = self.state
+        self.log(f"[HP] Dry-Run beendet - synchronisiere Zustand '{s}' auf Modbus")
+        if s in ("idle", "standby"):
+            self._pump_off()
+            self._set_wp_mode("off", 0)
+            self._mixer_full_close()
+        elif s == "heating":
+            self._pump_on()
+            sp = self._calc_flow_setpoint_smoothed()
+            self._set_wp_mode("heat", sp)
+            if self._ramp_c1_current is None:
+                # Dynamisches LP-Tracking fortsetzen (vorhandenen _forced_lp_value
+                # erhalten falls gesetzt, sonst aus aktuellem Auslass/Kurve initialisieren).
+                self._update_heating_setpoint()
+        elif s == "heating_forced":
+            self._pump_on()
+            lp = (
+                self._forced_lp_value
+                if self._forced_lp_value is not None
+                else self._wp_leaving_temp()
+            )
+            forced_c1 = round(
+                min(
+                    self._get_param("heat_curve_vl_low"),
+                    lp + self._forced_setpoint_offset + self._circuit1_offset,
+                ),
+                1,
+            )
+            self._set_forced_setpoint(forced_c1)
+            self._start_mixer_controller()
+        elif s == "hot_water":
+            self._pump_off()
+            self._set_wp_mode("hot_water", self._ww_target)
+            self._mixer_full_close()
+        elif s == "buffer_charge":
+            self._set_energy_state(3)  # korrekt: wie on_enter_buffer_charge
+            self._set_control_method(1)
+            self._set_wp_mode("buffer_charge", self._buffer_charge_inlet_temp)
+            self._update_charge_heating()
+        elif s == "buffer_charge_boost":
+            self._set_energy_state(self._boost_energy_state)
+            self._set_control_method(1)
+            self._set_wp_mode("buffer_charge", self._boost_inlet_temp)
+            self._update_charge_heating()
+        elif s == "buffer_drain":
+            self._pump_on()
+            self._set_energy_state(2)
+            self._set_wp_mode("off", 0)
+            sp = self._calc_flow_setpoint()
+            self._start_mixer_controller()
+            self.log(f"[HP] Dry-Run beendet (buffer_drain) - Vorlauf-Soll: {sp:.1f}C")
+
+    def _is_werktag(self) -> bool:
+        try:
+            state = self.get_state(self._binary_werktag)
+            if state not in (None, "unavailable", "unknown"):
+                return state == "on"
+        except Exception:
+            pass
+        return datetime.datetime.now().weekday() < 5
+
+    def _restore_hw_window_if_active(self):
+        """Nach Neustart: WW-Fenster wiederherstellen wenn gerade aktiv.
+        _hw_window_active und der Close-Timer gehen beim Neustart verloren.
+        """
+        now = datetime.datetime.now()
+        duration = datetime.timedelta(minutes=self._hw_duration_minutes)
+        is_werktag = self._is_werktag()
+
+        candidates = [self._hw_evening]  # Abend-Fenster immer pruefen
+        candidates.append(
+            self._hw_morning_weekday if is_werktag else self._hw_morning_weekend
+        )
+
+        for time_str in candidates:
+            h, m = self._parse_time(time_str)
+            window_start = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            window_end = window_start + duration
+            if window_start <= now < window_end:
+                remaining_s = (window_end - now).total_seconds()
+                self._hw_window_active = True
+                self.run_in(self._close_hw_window, remaining_s)
+                self.evaluate_transitions()
+                self.log(
+                    f"[HP] WW-Fenster ({time_str}) nach Neustart wiederhergestellt "
+                    f"- noch {remaining_s / 60:.0f} min"
+                )
+                return
+
+    def _open_hw_window_if_werktag(self, kwargs):
+        if self._is_werktag():
+            self._open_hw_window(kwargs)
+
+    def _open_hw_window_if_wochenende(self, kwargs):
+        if not self._is_werktag():
+            self._open_hw_window(kwargs)
+
+    def _open_hw_window(self, kwargs):
+        self.log(f"[HP] WW-Fenster öffnet für {self._hw_duration_minutes} min")
+        self._hw_window_active = True
+        if self._vacation_active():
+            self.log(
+                f"[HP] WW-Fenster: Urlaubsmodus -> kein WW-Modus, Zustand "
+                f"'{self.state}' bleibt"
+            )
+        elif not self._need_hot_water():
+            self.log(
+                f"[HP] WW-Fenster: 30006 {self._fmt_ww_temp()} >= "
+                f"{self._ww_start_threshold():.1f}C -> kein WW-Modus, Zustand "
+                f"'{self.state}' bleibt"
+            )
+        self.evaluate_transitions()
+        self.run_in(self._close_hw_window, self._hw_duration_minutes * 60)
+
+    def _close_hw_window(self, kwargs):
+        self.log("[HP] WW-Fenster schließt")
+        self._hw_window_active = False
+        if self.state == "hot_water" and not self._hw_manual:
+            self.log(
+                f"[HP] WW läuft weiter bis 30006 >= {self._ww_target:.1f}C "
+                f"(jetzt {self._fmt_ww_temp()}, {self.minutes_in_state():.0f} min im WW, "
+                f"Limit {self._get_param('hw_window_max_min'):.0f} min)"
+            )
+        self.evaluate_transitions()
+
+    # -------------------------------------------------------------------------
+    # Sensor-Lesehilfen
+    # -------------------------------------------------------------------------
+
+    def _sensor_value_or_none(self, entity: str, cache_attr: str) -> float | None:
+        """Sensor als float oder None. Gueltiger Wert wird in cache_attr gecached.
+        Bei unavailable: letzter gueltiger Cache, sonst None (KEIN Default).
+        None bedeutet fuer Schaltentscheidungen 'Wert unbekannt -> nicht entscheiden'.
+        Der Cache haelt den letzten ECHTEN Messwert: ein kurzer Sensor-Aussetzer im
+        Normalbetrieb liefert weiter gueltige Werte; nur direkt nach (Neu-)Start,
+        solange noch nie ein Wert kam, ist das Ergebnis None."""
+        raw = self.get_state(entity)
+        try:
+            val = float(raw)
+            setattr(self, cache_attr, val)
+            return val
+        except (TypeError, ValueError):
+            return getattr(self, cache_attr)
+
+    def _outdoor_temp(self) -> float:
+        """Letzten gueltigen AT-Wert cachen. Bei Sensorausfall wird der Cache gehalten
+        statt auf 30°C zu springen, was den Sollwert schlagartig auf 18°C fallen lassen wuerde.
+        Startup-Default 30°C (sicher warm) bis erster gueltiger Wert empfangen wird.
+        Fuer EINSCHALT-Checks (_need_heating/_need_buffer_drain) ist 'warm' die sichere
+        Richtung; Abschalt-Checks nutzen stattdessen _sensor_value_or_none() direkt."""
+        val = self._sensor_value_or_none(
+            self._sensor_outdoor_temp, "_outdoor_temp_cache"
+        )
+        return val if val is not None else 30.0
+
+    def _outdoor_temp_1h(self) -> float:
+        """1h-Mittelwert AT fuer Exit-Entscheidungen (schneller als EMA).
+        Fallback-Cache wie _outdoor_temp(); Startup-Default 30°C (sicher warm)."""
+        val = self._sensor_value_or_none(
+            self._sensor_outdoor_temp_1h, "_outdoor_temp_1h_cache"
+        )
+        return val if val is not None else 30.0
+
+    def _flow_temp(self) -> float:
+        """Letzten gueltigen VL-Wert cachen. Gibt None zurueck wenn nie ein gueltiger
+        Wert empfangen wurde (Startup), sonst den Cache bei unavailable."""
+        raw = self.get_state(self._sensor_flow_temp)
+        try:
+            val = float(raw)
+            self._flow_temp_cache = val
+            return val
+        except (TypeError, ValueError):
+            return self._flow_temp_cache if self._flow_temp_cache is not None else 30.0
+
+    def _raw_inlet_temp(self) -> float:
+        """Roher Einlass-Sensor (30003) ohne WP-Pumpen-Guard.
+        Fuer Checks bei nicht laufender WP (Hysterese, Ladeentscheidung).
+        """
+        return self.get_numeric_state(self._sensor_wp_inlet_temp, default=0.0)
+
+    def _wp_inlet_temp(self) -> float:
+        """Wassereinlasstemperatur WP (Modbus 30003) - Regelgroesse bei 40002=1.
+        Wenn Einlass = X°C, dann ist der gesamte Pufferspeicher >= X°C (Schichtung).
+        Fallback 0.0°C wenn WP-Umwaelzpumpe nicht laeuft: veralteter Sensorwert koennte
+        sonst faelschlicherweise einen fruehzeitigen Ausstieg aus buffer_charge ausloesen.
+        """
+        try:
+            if self._binary_wp_pump and self.get_state(self._binary_wp_pump) != "on":
+                return 0.0
+        except Exception:
+            pass
+        return self.get_numeric_state(self._sensor_wp_inlet_temp, default=0.0)
+
+    def _buffer_bottom(self) -> float:
+        val = self._sensor_value_or_none(
+            self._sensor_buffer_bottom, "_buffer_bottom_cache"
+        )
+        return val if val is not None else 35.0
+
+    def _buffer_mid(self) -> float:
+        val = self._sensor_value_or_none(self._sensor_buffer_mid, "_buffer_mid_cache")
+        return val if val is not None else 40.0
+
+    def _buffer_mid_valid(self) -> bool:
+        """True wenn fuer Puffer 1/2 jemals ein gueltiger Wert vorlag (Cache gefuellt).
+        Nach (Neu-)Start False bis der erste ESPHome-Wert eintrifft -> Schaltentscheidungen
+        die buffer_mid brauchen, treffen in diesem Fenster keine Aktion (halten Zustand)."""
+        return (
+            self._sensor_value_or_none(self._sensor_buffer_mid, "_buffer_mid_cache")
+            is not None
+        )
+
+    def _buffer_mid_high(self) -> float:
+        return self.get_numeric_state(self._sensor_buffer_mid_high, default=44.0)
+
+    def _buffer_top(self) -> float:
+        return self.get_numeric_state(self._sensor_buffer_top, default=48.0)
+
+    def _ww_temp(self) -> float | None:
+        """LG-WW-Fuehler 30006, None wenn unbekannt (kein Default)."""
+        return self._sensor_value_or_none(self._sensor_ww_temp, "_ww_temp_cache")
+
+    def _fmt_ww_temp(self) -> str:
+        ww = self._ww_temp()
+        return "?" if ww is None else f"{ww:.1f}C"
+
+    def _wp_leaving_temp(self) -> float:
+        if not self._sensor_wp_leaving_temp:
+            return self._flow_temp()
+        return self.get_numeric_state(
+            self._sensor_wp_leaving_temp, default=self._flow_temp()
+        )
+
+    def _pv_power_w(self) -> float:
+        return self.get_numeric_state(self._sensor_pv_power_w, default=0.0)
+
+    def _pv_energy_kwh(self) -> float:
+        return self.get_numeric_state(self._sensor_pv_energy_kwh, default=0.0)
+
+    def _parse_time(self, time_str: str) -> tuple[int, int]:
+        h, m = time_str.split(":")
+        return int(h), int(m)

@@ -1,0 +1,795 @@
+fsm_heatpump:
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Wärmepumpen-FSM – HA-Parametrierung
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  # ── Gleitender Mittelwert Außentemperatur ─────────────────────────────────────
+  # Verhindert FSM-Takt wenn AT um den Heizschwellenwert flackert.
+  # Entity-ID: sensor.aussenlufttemperatur_1h_mittelwert
+  sensor:
+    - platform: statistics
+      name: "Außentemperatur Mittelwert 1h"
+      unique_id: sensor_aussentemperatur_mittelwert_1h
+      entity_id: sensor.aussentemperatur_mittelwert
+      state_characteristic: mean
+      max_age:
+        hours: 1
+      sampling_size: 120
+      precision: 1
+
+  # ── Abtauzyklen-Zaehler ────────────────────────────────────────────────────────
+  # Zaehlt Flanken off->on von binary_sensor.abtauen_20005 (FSM: _on_defrost_start).
+  # Taeglich 00:00 von der FSM zurueckgesetzt (_reset_defrost_counter).
+  counter:
+    hp_defrost_count:
+      name: "Abtauzyklen heute"
+      icon: mdi:snowflake-melt
+      restore: true
+    # Nie zurueckgesetzt (kein run_daily-Reset in der FSM) - Basis fuer die
+    # Langzeitstatistik unten. counter.* selbst landet nicht in den HA-Statistics
+    # (kein state_class moeglich), daher der Umweg ueber den Template-Sensor.
+    hp_defrost_count_total:
+      name: "Abtauzyklen gesamt (roh)"
+      icon: mdi:snowflake-melt
+      restore: true
+
+  input_number:
+    # ── Heizkurve ──────────────────────────────────────────────────────────────
+    hp_heat_curve_at_high:
+      name: "Heizkurve AT oberer Stützpunkt (Heizgrenze)"
+      min: 10
+      max: 22
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-chevron-up
+      mode: slider
+
+    hp_heat_curve_vl_high:
+      name: "Heizkurve VL bei AT hoch"
+      min: 20
+      max: 40
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: slider
+
+    hp_heat_curve_at_low:
+      name: "Heizkurve AT unterer Stützpunkt (Auslegung)"
+      min: -25
+      max: 0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-chevron-down
+      mode: slider
+
+    hp_heat_curve_vl_low:
+      name: "Heizkurve VL bei AT niedrig"
+      min: 25
+      max: 50
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: slider
+
+    hp_pv_correction_per_kw:
+      name: "PV-Korrektur pro kW"
+      min: 0
+      max: 1.0
+      step: 0.05
+      unit_of_measurement: "°C/kW"
+      icon: mdi:solar-power
+      mode: slider
+
+    # ── AT EMA Witterungsführung ────────────────────────────────────────────────
+    # Exponentielle Glättung der Außentemperatur (Zeitkonstante τ einstellbar).
+    # α = 1 − e^(−dt/τ), Update alle 5 min. Schwere Bauweise: τ ≈ 12–24 h.
+    hp_at_ema_tau_hours:
+      name: "AT EMA Zeitkonstante"
+      min: 1
+      max: 72
+      step: 1
+      unit_of_measurement: "h"
+      icon: mdi:timer-sand
+      mode: slider
+
+    hp_at_ema_value:
+      name: "AT EMA Wert (intern)"
+      min: -30
+      max: 40
+      step: 0.01
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer
+      mode: box
+
+    # ── Pufferspeicher Schwellwerte ─────────────────────────────────────────────
+    hp_buffer_drain_margin:
+      name: "Puffer-Drain Sicherheitsabstand zum Sollwert"
+      min: 1
+      max: 10
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:arrow-up-circle-outline
+      mode: slider
+
+    hp_buffer_drain_hyst:
+      name: "Puffer-Drain Hysterese (EIN/AUS-Totband)"
+      min: 0
+      max: 5
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:arrow-split-horizontal
+      mode: slider
+
+    hp_ww_target_temp:
+      name: "Warmwasser Solltemperatur"
+      min: 45
+      max: 60
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:water-thermometer
+      mode: slider
+
+    # Spiegelt die WW-Einschaltdifferenz im LG-UI (muss dort identisch sein). initial:
+    # nur hier bewusst gesetzt, sonst startet ein neuer input_number auf min.
+    hp_ww_lg_hysteresis:
+      name: "WW Einschaltdifferenz LG (Start < Soll - x)"
+      min: 0.5
+      max: 5
+      step: 0.5
+      initial: 1.0
+      unit_of_measurement: "°C"
+      icon: mdi:arrow-split-horizontal
+      mode: slider
+
+    hp_buffer_charge_inlet_temp:
+      name: "PV-Ladung Einlass-Ziel (40002=1)"
+      min: 35
+      max: 60
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-water
+      mode: slider
+      # Mit 40002=1 (Wassereinlass-Regelung): WP laeuft bis Einlass (30003) >= X°C.
+      # Wenn Einlass = 50°C ist der gesamte Pufferspeicher >= 50°C (Schichtung).
+      # Ersetzt: hp_buffer_charge_on_temp, hp_buffer_charge_75pct, hp_buffer_charge_wp_offset.
+
+    hp_pv_buffer_min_kwh:
+      name: "PV-Restmenge Pufferladung – Minimum (EIN ab)"
+      min: 1
+      max: 15
+      step: 0.5
+      unit_of_measurement: "kWh"
+      icon: mdi:solar-power-variant
+      mode: slider
+
+    hp_pv_buffer_max_kwh:
+      name: "PV-Restmenge Pufferladung – Maximum (EIN bis)"
+      min: 5
+      max: 40
+      step: 0.5
+      unit_of_measurement: "kWh"
+      icon: mdi:solar-power-variant-outline
+      mode: slider
+      # Pufferladung startet nur wenn Tagesrest-kWh < dieser Wert.
+      # Beispiel: min=5, max=15 → Ladung startet wenn 5 ≤ Tagesrest < 15 kWh
+      # (also erst später am Nachmittag, nicht schon um 10 Uhr bei noch 25 kWh).
+      # Beim Verlassen des Zustands (AUS bei < min/2) bleibt diese Grenze ohne Wirkung.
+
+    # ── Heizstab-Boost ──────────────────────────────────────────────────────────
+    # Aktiviert sich automatisch aus buffer_charge wenn alle Bedingungen erfüllt sind.
+    # Die WP setzt Register 40010 (Energiezustand) auf boost_energy_state und erhöht
+    # den Kreis-1-Sollwert auf boost_target_temp. Der interne WP-Regler schaltet
+    # den Heizstab zu wenn die Solltemperatur allein nicht erreichbar ist.
+    # DIP-Schalter begrenzt Heizstab auf Stufe 1 = 3 kW.
+
+    hp_boost_inlet_temp:
+      name: "Boost Einlass-Ziel (40002=1)"
+      min: 45
+      max: 65
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-plus
+      mode: slider
+      # Einlass-Zieltemperatur fuer buffer_charge_boost (WP + Heizstab).
+      # Ersetzt: hp_boost_target_temp (Auslass-Ziel 65°C).
+
+    hp_boost_inlet_min_c:
+      name: "Boost Mindest-Einlass (Aktivierungsschwelle)"
+      min: 30
+      max: 55
+      step: 1
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-water
+      mode: slider
+      # Boost startet erst wenn Einlass (30003) >= X°C.
+      # Verhindert Boost-Aktivierung bei noch kaltem Puffer.
+      # Sollte < hp_buffer_charge_inlet_temp (50°C) sein, damit Boost
+      # noch waehrend buffer_charge aktiv werden kann.
+      # Ersetzt: hp_boost_return_min_c (Ruecklauf-Schwelle 50°C).
+
+    hp_buffer_charge_min_minutes:
+      name: "Pufferladung Mindestlaufzeit (Ausstieg)"
+      min: 2
+      max: 20
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+      # Verhindert Fehlausstieg durch heisses Rohrrestwasser im Sommerbetrieb:
+      # WP-interne Pumpe liest ~52°C Restwasser direkt nach Start -> exit waere falsch.
+      # Temperaturbasierter Ausstieg erst nach dieser Mindestlaufzeit moeglich.
+
+    hp_buffer_charge_hyst:
+      name: "Pufferladung Hysterese (Neustart-Schwelle)"
+      min: 1
+      max: 10
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-minus
+      mode: slider
+      # Neustart der Pufferladung erst wenn Puffer 1/2 unter
+      # (hp_buffer_charge_inlet_temp - hp_buffer_charge_hyst) faellt.
+      # Nicht Puffer 1/4: kuehlt beim Entladen durch den HK-Ruecklauf schnell ab.
+
+    hp_boost_pv_min_w:
+      name: "Boost PV-Mindestleistung (EIN)"
+      min: 2000
+      max: 6000
+      step: 100
+      unit_of_measurement: "W"
+      icon: mdi:solar-power
+      mode: slider
+      # PV muss > X W liefern (Heizstab 3kW + WP-Eigenbedarf ~1-2kW)
+
+    hp_boost_pv_off_w:
+      name: "Boost PV-Abschaltleistung (Hysterese)"
+      min: 0
+      max: 5000
+      step: 100
+      unit_of_measurement: "W"
+      icon: mdi:solar-power-variant-outline
+      mode: slider
+      # Boost wird beendet wenn PV < X W (Hysterese zu boost_pv_min_w)
+
+    hp_boost_pv_stable_minutes:
+      name: "Boost PV-Stabilitaet vor Start"
+      min: 0
+      max: 30
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-sand
+      mode: slider
+      # PV muss ununterbrochen >= hp_boost_pv_min_w liegen, bevor Boost startet.
+      # Verhindert Kurz-Boosts (< 1 min) durch kurze PV-Spitzen am Ende von buffer_charge.
+
+    hp_boost_min_minutes:
+      name: "Boost Mindestlaufzeit (Ausstieg)"
+      min: 0
+      max: 60
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+      # Ausstieg (Einlass-Ziel erreicht / PV zu schwach) erst nach dieser Mindestlaufzeit.
+      # Abtauen und Fensterende (boost_window_end) beenden Boost weiterhin sofort.
+
+    # ── Warmwasser-Zeiten ───────────────────────────────────────────────────────
+    hp_hw_duration_minutes:
+      name: "WW Fensterdauer"
+      min: 15
+      max: 120
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-outline
+      mode: slider
+
+    # ── PI-Regler Mischer ───────────────────────────────────────────────────────
+    hp_mixer_kp:
+      name: "Mischer Trim Kp (proportional)"
+      min: 0.0
+      max: 1.0
+      step: 0.05
+      unit_of_measurement: "%pt/°C"
+      icon: mdi:tune-vertical
+      mode: slider
+
+    hp_mixer_ki:
+      name: "Mischer Trim Ki (integral)"
+      min: 0.0
+      max: 0.1
+      step: 0.005
+      unit_of_measurement: "%pt/°C"
+      icon: mdi:tune-vertical-variant
+      mode: slider
+
+    hp_mixer_interval_s:
+      name: "Mischer Regelzyklus"
+      min: 5
+      max: 30
+      step: 5
+      unit_of_measurement: "s"
+      icon: mdi:timer
+      mode: slider
+
+    hp_mixer_max_step_pct:
+      name: "Mischer Max-Schritt pro Zyklus"
+      min: 1
+      max: 20
+      step: 0.5
+      unit_of_measurement: "%"
+      icon: mdi:chevron-double-up
+      mode: slider
+
+    hp_mixer_warmstart_position:
+      name: "Mischer Warmstart-Position"
+      min: 0
+      max: 50
+      step: 5
+      unit_of_measurement: "%"
+      icon: mdi:valve-open
+      mode: slider
+
+    hp_mixer_dt_min:
+      name: "Mischer FF min. (Tank-RL)"
+      min: 2
+      max: 15
+      step: 1
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-minus
+      mode: slider
+
+    hp_mixer_trim_limit_pct:
+      name: "Mischer Trim-Limit"
+      min: 5
+      max: 40
+      step: 1
+      unit_of_measurement: "%"
+      icon: mdi:arrow-expand-vertical
+      mode: slider
+
+    # ── Ventil-Kalibrierung (FOPDT-Stufentest) ─────────────────────────────────
+    # Haltezeit je Stufe: FOPDT-Sprungantwort erreicht ~99% bei t = Totzeit + 5*tau.
+    # Mit Totzeit=2.3min, tau=6.4min (Charakterisierung RL-Strecke) -> ~34.3min,
+    # aufgerundet 35min Default. NICHT 5*Totzeit (=11.5min) - das waere nur ~76%
+    # eingeschwungen.
+    # Kurzversion (weniger Waermeverbrauch): ~20min reichen, wenn der Endwert +
+    # L/tau aus der Anstiegsflanke geschaetzt statt abgewartet wird (FOPDT-Fit).
+    hp_mixer_calibration_hold_min:
+      name: "Mischer-Kalibrierung Haltezeit je Stufe"
+      min: 10
+      max: 60
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:timer-sand
+      mode: box
+      initial: 35
+
+    # ── Mindestlaufzeit & Verdichterschutz ─────────────────────────────────────
+    hp_min_runtime_minutes:
+      name: "Mindestlaufzeit Kompressor"
+      min: 10
+      max: 90
+      step: 5
+      unit_of_measurement: "min"
+      icon: mdi:timer-check
+      mode: slider
+
+    hp_standby_minutes:
+      name: "Verdichterschutz-Pause"
+      min: 1
+      max: 10
+      step: 1
+      unit_of_measurement: "min"
+      icon: mdi:shield-half-full
+      mode: slider
+
+    hp_cycling_window_minutes:
+      name: "Takt-Schutz Beobachtungsfenster"
+      min: 30
+      max: 120
+      step: 10
+      unit_of_measurement: "min"
+      icon: mdi:timer-alert
+      mode: slider
+
+    hp_cycling_max_starts:
+      name: "Takt-Schutz Max-Starts im Fenster"
+      min: 3
+      max: 12
+      step: 1
+      unit_of_measurement: ""
+      icon: mdi:counter
+      mode: slider
+
+    # Kreis-1-Offset zum LG-Auslass 30004 (Dallas-Anlegefühler liegt ≈ 3.9 K tiefer).
+    # Sollwert −3.0: Kreis 1 ≈ Auslass − 2 K. Summe mit hp_circuit1_offset muss < 0 bleiben,
+    # sonst Mitkopplung. Kein initial: (würde den gespeicherten Wert überschreiben).
+    hp_forced_setpoint_offset:
+      name: "Mindestlaufzeit Sollwert-Offset"
+      min: -5.0
+      max: 5.0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:thermometer-plus
+      mode: slider
+
+    hp_forced_lp_alpha:
+      name: "Mindestlaufzeit Low-Pass Alpha"
+      min: 0.05
+      max: 1.0
+      step: 0.05
+      unit_of_measurement: ""
+      icon: mdi:filter
+      mode: slider
+
+# ── LG ThermaV Kreis-Offset ────────────────────────────────────────────────
+    hp_circuit1_offset:
+      name: "Kreis 1 Offset gegenüber Kreis 2"
+      min: 0.0
+      max: 5.0
+      step: 0.5
+      unit_of_measurement: "°C"
+      icon: mdi:swap-vertical
+      mode: slider
+
+    # ── Dashboard-Visualisierung (read-only, AppDaemon schreibt) ───────────────
+    hp_mischer_pi_position:
+      name: "Mischer PI-Soll-Position"
+      min: 0
+      max: 100
+      step: 0.1
+      unit_of_measurement: "%"
+      icon: mdi:valve
+      mode: slider
+
+  # Hinweis: Kein `initial:` bei input_number/input_select – HA wuerde sonst bei jedem
+  # Neustart den gespeicherten Wert ueberschreiben (HA-Quellcode: if self._initial is not None: return).
+  # Standardwerte stehen im _DEFAULTS-Dict in heatpump_fsm.py und in SUMMARY.md.
+  # Erstinstallation: Entities starten als 'unknown', FSM nutzt _DEFAULTS als Fallback.
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Dry-Run / Simulationsmodus
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  input_boolean:
+    hp_dry_run:
+      name: "WP FSM Simulationsmodus (Dry-Run)"
+      icon: mdi:test-tube
+      # EIN: FSM rechnet alles durch, kein Modbus-Write
+      # AUS: Normalbetrieb
+
+    hp_vacation:
+      name: "Urlaubsmodus"
+      icon: mdi:palm-tree
+      # Kein initial: -> Zustand übersteht HA-Neustarts (restore).
+      # EIN: FSM sperrt WW im Fenster (laufender Fenster-WW endet, manuell erzwungenes
+      #      WW bleibt möglich), PV-Ladung und PV-Boost (laufende enden -> standby),
+      #      Heizkurve Kreis 2 um vacation_setback_k (Default 1.0 K) abgesenkt.
+      # AUS: alles wieder normal.
+
+    hp_mixer_ff:
+      name: "Mischer Feedforward"
+      icon: mdi:function-variant
+      initial: true
+      # EIN: FF (invertierte Mischgleichung) + langsamer PI-Trim
+      # AUS: nur PI-Trim um die zuletzt gehaltene FF-Position (A/B-Test)
+
+    hp_mixer_calibration_run:
+      name: "Mischer-Kalibrierung starten (FOPDT-Stufentest)"
+      icon: mdi:play-box-outline
+      # EIN -> löst Automation "Mischer Kalibrierung: FOPDT-Stufentest" aus.
+      # Schaltet sich am Ende der Automation selbst wieder aus.
+
+  input_text:
+    hp_mixer_calibration_step:
+      name: "Mischer-Kalibrierung aktuelle Stufe"
+      icon: mdi:stairs
+      initial: "idle"
+      # Marker fuer die Auswertung: jede Wertaenderung ist ein exakter
+      # Zeitstempel in der recorder-DB (states-Tabelle), an dem die Automation
+      # eine neue Sollposition angefahren hat. Werte: "0".."100" (Stufe in %),
+      # "start"/"done" als Rahmenmarken.
+
+    hp_mixer_calibration_steps:
+      name: "Mischer-Kalibrierung Stufenliste"
+      icon: mdi:format-list-numbered
+      initial: "0,20,40,60,80,100"
+      max: 100
+      # Komma-getrennte Liste der anzufahrenden Positionen (%), z.B. "60,80,100"
+      # fuer eine Nachmessung nur des oberen Bereichs (spart Zeit + Waerme).
+
+  input_datetime:
+    hp_hw_morning_weekday:
+      name: "WW Morgens Werktag (Mo–Fr)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-start
+
+    hp_hw_morning_weekend:
+      name: "WW Morgens Wochenende (Sa–So)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-start
+
+    hp_hw_evening:
+      name: "WW Abends (täglich)"
+      has_date: false
+      has_time: true
+      icon: mdi:clock-end
+
+  input_select:
+    hp_boost_energy_state:
+      name: "Boost Energiezustand (Register 40010)"
+      icon: mdi:lightning-bolt-circle
+      options:
+        - "3 – Empfehlung Ein (+2°C)"
+        - "4 – Befehl Ein (WW 80°C)"
+        - "5 – Befehl++ (+5°C, Heizstab)"
+        - "6 – Empfehlung+ (+2°C)"
+        - "7 – Energiesparen (-2°C)"
+        - "8 – Superenergiespar (-5°C)"
+
+    heatpump_state:
+      name: "Wärmepumpe FSM Zustand"
+      options:
+        - idle
+        - heating
+        - heating_forced
+        - hot_water
+        - buffer_charge
+        - buffer_charge_boost
+        - buffer_drain
+        - standby
+      icon: mdi:state-machine
+
+  template:
+    - sensor:
+        - name: "Mischer Ist-Position"
+          unique_id: fsm_sensor_mischer_ist_position
+          unit_of_measurement: "%"
+          icon: mdi:valve
+          # Kein int(0)-Default: nach HA-Neustart (Backup ~02:05) fehlt das Attribut kurz,
+          # das Dashboard zeigte dann eine Schein-0 %. Jetzt "nicht verfuegbar" (Luecke).
+          availability: >
+            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') is not none }}
+          state: >
+            {{ state_attr('cover.lg_thermav_circuit_2_1e6134_rl_mischer', 'current_position') | int }}
+
+        - name: "WW Start unter"
+          unique_id: fsm_sensor_ww_start_unter
+          unit_of_measurement: "°C"
+          icon: mdi:water-thermometer-outline
+          state_class: measurement
+          # Einschaltpunkt der LG / FSM: 30006 < Soll - Einschaltdifferenz
+          state: >
+            {{ (states('input_number.hp_ww_target_temp') | float(0)
+                - states('input_number.hp_ww_lg_hysteresis') | float(0)) | round(1) }}
+
+        - name: "Heizkurve Sollwert Kreis 2"
+          unique_id: fsm_sensor_sollwert_kreis2
+          unit_of_measurement: "°C"
+          icon: mdi:thermometer-water
+          state_class: measurement
+          # Der von der FSM angewendete Sollwert (inkl. geglaetteter PV-Korrektur,
+          # siehe _pv_kw_smoothed) - nicht mehr eine eigene Nachrechnung mit
+          # ungeglaetteter PV, die vom echten Sollwert abwich.
+          state: >
+            {{ states('input_number.thermav_40006') | float(0) | round(1) }}
+
+        - name: "Heizkurve Sollwert Kreis 1"
+          unique_id: fsm_sensor_sollwert_kreis1
+          unit_of_measurement: "°C"
+          icon: mdi:thermometer-chevron-up
+          state_class: measurement
+          state: >
+            {% set kreis2 = states('sensor.heizkurve_sollwert_kreis_2') | float(0) %}
+            {% set offset = states('input_number.hp_circuit1_offset') | float(1) %}
+            {{ (kreis2 + offset) | round(1) }}
+
+        - name: "Außentemperatur Mittelwert"
+          unique_id: sensor_aussentemperatur_mittelwert
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          state: >
+            {% set sensors = [
+              'sensor.aussentemperatur_zigbee',
+              'sensor.aussenlufttemperatur_30013',
+              'sensor.open_meteo_temperatur'
+            ] %}
+            {% set values = namespace(list=[]) %}
+            {% for s in sensors %}
+              {% set v = states(s) %}
+              {% if v not in ['unavailable', 'unknown', 'none', ''] %}
+                {% set values.list = values.list + [v | float] %}
+              {% endif %}
+            {% endfor %}
+            {% if values.list | count > 0 %}
+              {{ (values.list | sum / values.list | count) | round(1) }}
+            {% else %}
+              unavailable
+            {% endif %}
+
+        - name: "Abtauzyklen gesamt"
+          unique_id: fsm_sensor_abtauzyklen_gesamt
+          icon: mdi:snowflake-melt
+          state_class: total_increasing
+          # Spiegelt counter.hp_defrost_count_total als sensor, damit die
+          # Langzeitstatistik (ueberlebt die ~10 Tage Recorder-Retention) greift -
+          # counter.* selbst hat keinen state_class und wird nicht statistisch erfasst.
+          state: >
+            {{ states('counter.hp_defrost_count_total') | int(0) }}
+
+        - name: "Außentemperatur EMA"
+          unique_id: fsm_sensor_at_ema
+          unit_of_measurement: "°C"
+          device_class: temperature
+          state_class: measurement
+          icon: mdi:thermometer-lines
+          state: >
+            {% set v = states('input_number.hp_at_ema_value') %}
+            {% if v in ('unknown', 'unavailable') %}{{ none }}
+            {% else %}{{ v | float | round(1) }}{% endif %}
+
+    - binary_sensor:
+        - name: "Werktag"
+          unique_id: binary_werktag
+          state: >
+            {{ now().weekday() < 5
+              and not is_state('calendar.feiertage_niedersachsen', 'on') }}
+          device_class: running
+          icon: mdi:calendar-today
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # Modbus-Automation
+  # ═══════════════════════════════════════════════════════════════════════════════
+  automation:
+    - alias: "Modbus: Solltemperatur Kreis 1 (40003)"
+      id: fsm_modbus_write_40003
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40003
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 2
+            value: "{{ (states('input_number.thermav_40003') | float * 10) | int }}"
+
+    - alias: "Modbus: Solltemperatur Kreis 2 (40006)"
+      id: fsm_modbus_write_40006
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40006
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 5
+            value: "{{ (states('input_number.thermav_40006') | float * 10) | int }}"
+
+    - alias: "Modbus: WW-Solltemperatur (40009)"
+      id: fsm_modbus_write_40009
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40009
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 8
+            value: "{{ (states('input_number.thermav_40009') | float * 10) | int }}"
+
+    - alias: "Modbus: Energiezustand (40010)"
+      id: fsm_modbus_write_40010
+      triggers:
+        - trigger: state
+          entity_id: input_number.thermav_40010
+      actions:
+        - action: modbus.write_register
+          data:
+            hub: modbus_waveshare
+            slave: 1
+            address: 9
+            value: "{{ states('input_number.thermav_40010') | int }}"
+
+    - alias: "AT EMA Update (alle 5 Minuten)"
+      id: fsm_at_ema_update
+      triggers:
+        - trigger: time_pattern
+          minutes: "/5"
+      actions:
+        - variables:
+            at_now: "{{ states('sensor.aussentemperatur_mittelwert') | float(99) }}"
+            ema_prev: "{{ states('input_number.hp_at_ema_value') | float(99) }}"
+            tau_h: "{{ states('input_number.hp_at_ema_tau_hours') | float(24) }}"
+        - condition: template
+          value_template: "{{ at_now | abs < 90 }}"
+        - choose:
+            - conditions: "{{ ema_prev >= 90 }}"
+              # Entity unbekannt/unavailable: Erst-Deploy oder kein gespeicherter Zustand.
+              # Tritt nur auf wenn initial: fehlt und noch kein Wert gespeichert wurde.
+              sequence:
+                - action: input_number.set_value
+                  target:
+                    entity_id: input_number.hp_at_ema_value
+                  data:
+                    value: "{{ at_now | round(2) }}"
+          default:
+            - variables:
+                alpha: "{{ 1 - 2.718281828 ** (-(5.0 / 60.0) / tau_h) }}"
+            - action: input_number.set_value
+              target:
+                entity_id: input_number.hp_at_ema_value
+              data:
+                value: "{{ (alpha * at_now + (1 - alpha) * ema_prev) | round(2) }}"
+
+    - alias: "Mischer Kalibrierung: FOPDT-Stufentest"
+      id: fsm_mixer_calibration_fopdt_stufentest
+      description: >
+        Ventil-Kennlinien-Test: FSM auf Dry-Run (kein Modbus/Cover/Pumpen-Write
+        durch die FSM selbst), Grundfos-Pumpe manuell an, Mischer faehrt die
+        Stufen aus hp_mixer_calibration_steps ab (Default "0,20,40,60,80,100" -
+        fuer eine Nachmessung nur "60,80,100" setzen, spart Zeit + Waerme).
+        Haltezeit je Stufe = hp_mixer_calibration_hold_min. Fuer volles
+        Einschwingen (~99%) Totzeit+5*tau der Strecke verwenden (mit L=2.3min/
+        tau=6.4min ~35min); fuer eine Kurzversion mit anschliessender FOPDT-
+        Parameterschaetzung (Grid-Search-Fit statt Warten)
+        reichen ~20min, sofern genug Punkte der Anstiegsflanke sichtbar sind.
+        input_text.hp_mixer_calibration_step ist die Zeitmarke fuer
+        die Auswertung (jede Wertaenderung = exakter Zeitstempel in der
+        recorder-DB).
+        WICHTIG danach: dry_run ist am Ende aus, aber der interne PI-Regler
+        (_pi_position) kennt die manuellen Stufen nicht - beim naechsten
+        Zustandseintritt (on_enter_heating/buffer_drain) wird die reale
+        Cover-Position neu eingelesen, siehe _pi_start_position().
+      mode: single
+      triggers:
+        - trigger: state
+          entity_id: input_boolean.hp_mixer_calibration_run
+          to: "on"
+      actions:
+        - action: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.hp_dry_run
+        - action: switch.turn_on
+          target:
+            entity_id: switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.hp_mixer_calibration_step
+          data:
+            value: "start"
+        - variables:
+            step_list: >-
+              {{ (states('input_text.hp_mixer_calibration_steps')
+                  | default('0,20,40,60,80,100'))
+                 .split(',') | map('trim') | map('int') | list }}
+        - repeat:
+            for_each: "{{ step_list }}"
+            sequence:
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.hp_mixer_calibration_step
+                data:
+                  value: "{{ repeat.item }}"
+              - action: cover.set_cover_position
+                target:
+                  entity_id: cover.lg_thermav_circuit_2_1e6134_rl_mischer
+                data:
+                  position: "{{ repeat.item }}"
+              - delay: "{{ (states('input_number.hp_mixer_calibration_hold_min') | int(35)) * 60 }}"
+        - action: input_text.set_value
+          target:
+            entity_id: input_text.hp_mixer_calibration_step
+          data:
+            value: "done"
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.hp_dry_run
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.hp_mixer_calibration_run

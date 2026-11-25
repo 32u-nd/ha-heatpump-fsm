@@ -1,0 +1,108 @@
+# ============================================================
+# AppDaemon Apps-Konfiguration
+# Liegt in: /conf/apps/apps.yaml
+# ============================================================
+
+heatpump_fsm:
+  module: heatpump_fsm
+  class: HeatpumpFSM
+  log_level: DEBUG
+  ha_param_prefix: "input_number.hp_"
+
+  # ── Sensoren ────────────────────────────────────────────────
+  # EMA (τ=24h default) dämpft AT-Flackern; Zeitkonstante per Dashboard einstellbar
+  sensor_outdoor_temp:    sensor.aussentemperatur_ema
+  sensor_outdoor_temp_1h: sensor.aussentemperatur_mittelwert_1h
+  sensor_pv_power_w:      sensor.pv_produktion_15m
+  sensor_pv_energy_kwh:   sensor.pv_energy_production_today_remaining
+  sensor_flow_temp:       sensor.hp_temp_sensors_2036e1_heizung_vl
+  sensor_return_temp:     sensor.hp_temp_sensors_2036e1_hydrobox_einlauf
+  # Heizkreis-Ruecklauf (Kalt-Eingang des Mischers) - Mischer-Feedforward (T_RL)
+  sensor_mixer_return_temp: sensor.hp_temp_sensors_2036e1_heizung_rl
+  # LG-Auslass (Modbus 30004) statt Dallas-Anlegefühler: die LG schaltet nach diesem Fühler ab
+  # (Auslass > Kreis 1 + 4 °C); der Dallas liegt ≈ 3.9 K tiefer
+  sensor_wp_leaving_temp: sensor.wasserauslasstemperatur_30004
+  sensor_buffer_bottom:   sensor.hp_temp_sensors_2036e1_tank_1_4
+  sensor_buffer_mid:      sensor.hp_temp_sensors_2036e1_tank_2_4
+  sensor_buffer_mid_high: sensor.hp_temp_sensors_2036e1_tank_3_4
+  sensor_buffer_top:      sensor.hp_temp_sensors_2036e1_tank_4_4
+  # LG-WW-Fuehler (Modbus 30006): WW-Einstieg/-Ende, die LG laedt nach diesem Fuehler
+  sensor_ww_temp:         sensor.temperatur_pufferspeicher_30006
+  # Wassereinlass WP (Modbus 30003) - Regelgroesse bei 40002=1 (Einlass-Regelung)
+  sensor_wp_inlet_temp:   sensor.wassereinlasstemperatur_30003
+
+  # ── Steuerung ───────────────────────────────────────────────
+  # Modbus-Hub fuer direkten Register-Write (40002 Steuermethode)
+  modbus_hub:               modbus_waveshare
+  modbus_slave:             1
+  switch_heating:           switch.heizungsschalter_10001
+  switch_hot_water:         switch.warmwasserschalter_10002
+  input_setpoint_circuit1:  input_number.thermav_40003
+  input_setpoint_circuit2:  input_number.thermav_40006
+  input_setpoint_ww:        input_number.thermav_40009
+  input_energy_state:       input_number.thermav_40010
+  binary_compressor:        binary_sensor.kompressor_20004
+  binary_wp_pump:           binary_sensor.umwalzpumpe_20002
+  binary_defrost:           binary_sensor.abtauen_20005
+  counter_defrost:          counter.hp_defrost_count
+  counter_defrost_total:    counter.hp_defrost_count_total
+  binary_aux_heater_1:      binary_sensor.zusatzheizung_1_20011
+  binary_aux_heater_2:      binary_sensor.zusatzheizung_2_20012
+  binary_werktag:           binary_sensor.werktag
+  cover_mixer:              cover.lg_thermav_circuit_2_1e6134_rl_mischer
+  mixer_full_travel_s:      123
+
+  # ── Grundfos Heizkreispumpe ──────────────────────────────────
+  switch_circuit2_pump:     switch.lg_thermav_circuit_2_1e6134_grundfos_pumpe
+  switch_silent_mode:       switch.silent_mode_10003
+
+  # ── Heizstab-Boost ──────────────────────────────────────────
+  boost_window_start:     "10:00"
+  boost_window_end:       "18:00"
+
+  # ── Dry-Run ─────────────────────────────────────────────────
+  dry_run_entity:         input_boolean.hp_dry_run
+  vacation_entity:        input_boolean.hp_vacation   # Urlaubsmodus (WW/PV-Ladung/Boost aus, Kreis 2 - vacation_setback_k)
+
+  # ── E-Stop: Takt-Schutz ─────────────────────────────────────
+  # Aktiviert dry_run wenn > estop_max_transitions Wechsel in estop_window_seconds
+  estop_entity:           input_boolean.hp_dry_run
+  estop_max_transitions:  10
+  estop_window_seconds:   5
+
+  # ── Mischer-Schonung (Stellantrieb-Lebensdauer) ─────────────
+  # Nicht als input_number auf dem Dashboard (HA setzt neue input_number ohne
+  # initial: auf min) - hier einstellbar, wirksam nach AppDaemon-Neustart.
+  # Ein gleichnamiges input_number.hp_<key> hat Vorrang (siehe _get_param).
+  pv_smooth_minutes:        60    # PV-Korrektur: Zeitkonstante der Zusatz-Glaettung (min)
+  mixer_error_db_c:         0.5   # Totband Soll-Ist Kreis 2 fuer den Trim (°C)
+  mixer_move_db_pct:        3     # Fahrbefehl erst ab |Ideal-Ist| >= x %pt
+  mixer_min_move_s:         60    # Mindestabstand zwischen Fahrbefehlen (s)
+  mixer_big_move_pct:       10    # ab dieser Abweichung gilt der Mindestabstand nicht
+  mixer_sensor_tau_s:       60    # Tiefpass Tank-/RL-Fuehler im FF (s, 0 = aus)
+  mixer_start_hold_s:       180   # nach Pumpenstillstand: Position halten (s)
+  mixer_trim_init_max_pct:  8     # max. Trim-Vorbelegung beim Start (%pt)
+  setpoint_tau_s:           45    # Sollwert-Glaettung, zeitbasiert (s)
+
+  # ── Warmwasser ──────────────────────────────────────────────
+  # WW-Einschaltdifferenz der LG (LG-UI, auf 30006): WW-Modus im Fenster erst bei
+  # 30006 < ww_target - x (°C), darueber laedt die LG nicht und der Zustand bleibt.
+  ww_lg_hysteresis:         1.0
+  # Manuell erzwungenes WW: Zeitlimit (min), falls ww_target nie erreicht wird
+  hw_manual_max_min:        60
+  # WW aus dem Fenster läuft über das Fensterende hinaus bis 30006 >= Ziel; Abbruch nach x min
+  hw_window_max_min:        90
+
+  # ── Neustart-Schutz (Backup ~02:05) ─────────────────────────
+  # Nach (Neu-)Start: HA-Services-Delay vor erster Transition-Pruefung,
+  # damit Sensoren Zeit zum Hochkommen haben (ESPHome reconnect, Recorder).
+  initial_enter_delay_s:  30
+  # Zeitfenster nach Start, in dem KEINE WP-Abschaltung erfolgt
+  # (heating->standby, heating_forced->standby, buffer_drain->idle).
+  startup_grace_seconds:  180
+
+  # ── HA-Integration ──────────────────────────────────────────
+  input_select_entity:    input_select.heatpump_state
+  fire_events:            true
+  log_transitions:        true
+  event_prefix:           fsm_heatpump
